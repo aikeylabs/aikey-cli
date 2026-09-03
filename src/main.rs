@@ -38,11 +38,14 @@ mod synapse;
 mod team_token_normalize;
 mod time_zone;
 // mod commands_env; // removed: env commands dropped
+mod commands_mcp;
 mod commands_proxy;
-mod enterprise_proxy; // Production form-⓪ multi-protocol proxy delivery (Phase 3)
-                      // Layer 1 (state-machine read path) + Layer 2 (write path). Stage 1-2
-                      // of proxy lifecycle state machine refactor; commands_proxy.rs is in
-                      // the process of being migrated to thin shells over these.
+mod enterprise_proxy;
+mod mcp_adopt; // 阶段8 P14: move existing credentials into the vault
+mod mcp_scan; // 阶段8 P14: MCP client-config inventory (read-only) // Production form-⓪ multi-protocol proxy delivery (Phase 3)
+              // Layer 1 (state-machine read path) + Layer 2 (write path). Stage 1-2
+              // of proxy lifecycle state machine refactor; commands_proxy.rs is in
+              // the process of being migrated to thin shells over these.
 #[allow(dead_code)]
 mod commands_account;
 mod commands_agent;
@@ -4871,6 +4874,103 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Watch => {
             commands_watch::run()?;
         }
+        // 阶段8 P5 task 5.6 — hosting local MCP servers.
+        //
+        // 🔴 Only the `add --secret-stdin` branch can reach a password prompt,
+        // and it reaches it through a CLOSURE that the command calls only on
+        // the path that genuinely stores a secret. That is what makes `list`,
+        // `remove`, `test` and the common `add` zero-password (task 5.6b) a
+        // structural property rather than a promise: the other paths have no
+        // way to call it.
+        Commands::Mcp(sub) => match sub {
+            cli::McpCommands::Add {
+                name,
+                command,
+                args,
+                credential,
+                credential_env,
+                secret_stdin,
+                replace,
+            } => {
+                commands_mcp::cmd_add(
+                    name,
+                    command,
+                    args,
+                    credential.as_deref(),
+                    credential_env.as_deref(),
+                    *secret_stdin,
+                    *replace,
+                    cli.json,
+                    || {
+                        prompt_vault_password_fresh(cli.password_stdin, cli.json)
+                            .map_err(|e| e.to_string())
+                    },
+                )?;
+            }
+            cli::McpCommands::List => commands_mcp::cmd_list(cli.json)?,
+            cli::McpCommands::Remove { name } => commands_mcp::cmd_remove(name, cli.json)?,
+            cli::McpCommands::Test { name } => commands_mcp::cmd_test(name.as_deref(), cli.json)?,
+            // 阶段8 P14 task 14.1 — read-only inventory. It is in this match
+            // arm's zero-password group by construction: it never reaches the
+            // password closure above, because it never touches the vault.
+            cli::McpCommands::Scan => mcp_scan::cmd_scan(cli.json)?,
+            // 阶段8 P14 task 14.2 — the only branch in this match that writes
+            // to the user's home directory, and the only one that may ask for
+            // the master password. 🔴 It asks ONCE, and only when the run
+            // actually stores something new: a run finishing an interrupted
+            // earlier one needs no password at all.
+            cli::McpCommands::Adopt {
+                server,
+                key,
+                dry_run,
+                yes,
+            } => {
+                mcp_adopt::cmd_adopt(server, key.as_deref(), *dry_run, *yes, cli.json, || {
+                    prompt_vault_password_fresh(cli.password_stdin, cli.json)
+                        .map_err(|e| e.to_string())
+                })?;
+            }
+            // 阶段8 P14 task 14.3 — Personal edition's review surface. Also in
+            // the zero-password group: it asks the running proxy, which already
+            // holds everything it needs, so no branch here reaches the closure.
+            cli::McpCommands::Review {
+                accept,
+                except,
+                read_only,
+                write,
+            } => {
+                // 🔴 Refused rather than ordered. `--accept` and `--read-only`
+                // together would leave the user guessing which ran first, and
+                // one of them changes what a tool is allowed to do.
+                let given = [accept.is_some(), read_only.is_some(), write.is_some()]
+                    .iter()
+                    .filter(|b| **b)
+                    .count();
+                if given > 1 {
+                    return Err(
+                        "give at most one of --accept, --read-only or --write at a time"
+                            .to_string()
+                            .into(),
+                    );
+                }
+                let action = if let Some(b) = accept {
+                    commands_mcp::ReviewAction::Accept { backend: b, except }
+                } else if let Some(t) = read_only {
+                    commands_mcp::ReviewAction::Classify {
+                        target: t,
+                        write_op: false,
+                    }
+                } else if let Some(t) = write {
+                    commands_mcp::ReviewAction::Classify {
+                        target: t,
+                        write_op: true,
+                    }
+                } else {
+                    commands_mcp::ReviewAction::Show
+                };
+                commands_mcp::cmd_review(action, cli.json)?;
+            }
+        },
         Commands::Audit { action } => match action {
             AuditAction::Status => {
                 commands_audit::handle_status(cli.json)?;
