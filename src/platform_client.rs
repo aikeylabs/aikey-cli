@@ -629,6 +629,28 @@ pub(crate) fn parse_licensed_company_name(body: &str) -> Option<String> {
 
 impl PlatformClient {
     /// Creates a new client using a JWT already stored in `platform_account`.
+    // ── Control-plane time budgets (2026-09-04) ──────────────────────────────
+    //
+    // Every call in this file talks to a master that, in a private deployment,
+    // fails by BLACK-HOLING packets (dropped, no RST). Unbounded, such a call
+    // hangs for the OS connect/read retry budget — tens of seconds with no
+    // feedback. On 2026-09-04, 11 of 13 calls here had no budget at all.
+    //
+    // Two budgets, not ten hand-picked numbers: the distinction that actually
+    // changes the right answer is "is a human watching a spinner right now?".
+    // Anything finer would be numbers without a reason behind them.
+    /// A human is staring at a spinner and will read "it is broken" into any
+    /// longer wait. Only `init_cli_login` qualifies: aikey-tray's panel claims
+    /// a browser window opened the moment the CLI process starts, so THIS call's
+    /// budget is the lifetime of that claim.
+    pub(crate) const BUDGET_INTERACTIVE: std::time::Duration = std::time::Duration::from_secs(5);
+    /// Everything else: background, retryable, or already behind its own
+    /// progress output. Generous on purpose — a loaded private-deployment
+    /// master is allowed to be slow (`start_cli_login` even sends mail
+    /// server-side). Too tight would turn "slow but alive" into "cannot sign
+    /// in", which is a worse bug than the one being fixed.
+    pub(crate) const BUDGET_STANDARD: std::time::Duration = std::time::Duration::from_secs(15);
+
     pub fn new(base_url: &str, jwt: &str) -> Self {
         PlatformClient {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -645,6 +667,7 @@ impl PlatformClient {
         let body = serde_json::json!({ "email": email, "password": password });
 
         let resp = ureq::post(&url)
+            .timeout(Self::BUDGET_STANDARD)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| format!("login request failed: {}", explain(base_url, e)))?;
@@ -669,8 +692,28 @@ impl PlatformClient {
             "client_version": client_version,
             "os_platform": os_platform,
         });
+        // 🔴 5s budget (2026-09-04, user decision "5s 弹登录失败吧").
+        //
+        // WHY this call in particular: it is the FIRST thing both the browser
+        // and the --sso flows do, and the browser is only opened AFTER it
+        // returns. Until it does, aikey-tray's panel already shows "请在刚打开
+        // 的浏览器窗口完成授权" — a window that does not exist yet. Unbounded,
+        // that false sentence stood for the OS connect timeout (tens of seconds
+        // against a black-holed host, which is exactly how a private-deployment
+        // master fails: packets dropped, no RST). Bounded, the panel flips to a
+        // real error with the real reason within 5s.
+        //
+        // WHY 5s and not the 2s its siblings use: probe_token/licensed_company_name
+        // are read-only probes with a cached fallback, so failing fast costs
+        // nothing. This POST CREATES a login session on the server, and a loaded
+        // private-deployment master is allowed to be slow — a 2s budget would
+        // turn "slow but alive" into "cannot sign in", trading one bug for a
+        // worse one.
+        //
+        // bugfix: workflow/CI/bugfix/2026-09-04-tray-claims-browser-opened-before-master-reached.md
         let resp = ureq::post(&url)
             .set("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(5))
             .send_json(&body)
             .map_err(|e| format!("login init failed: {}", explain(base_url, e)))?;
         resp.into_json::<InitSessionResponse>()
@@ -693,6 +736,7 @@ impl PlatformClient {
             "os_platform": os_platform,
         });
         let resp = ureq::post(&url)
+            .timeout(Self::BUDGET_STANDARD)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| format!("login start failed: {}", explain(base_url, e)))?;
@@ -713,6 +757,7 @@ impl PlatformClient {
             "device_code": device_code,
         });
         let resp = ureq::post(&url)
+            .timeout(Self::BUDGET_STANDARD)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| format!("poll request failed: {}", explain(base_url, e)))?;
@@ -736,6 +781,7 @@ impl PlatformClient {
             "login_token": login_token,
         });
         let resp = ureq::post(&url)
+            .timeout(Self::BUDGET_STANDARD)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| format!("exchange request failed: {}", explain(base_url, e)))?;
@@ -756,6 +802,7 @@ impl PlatformClient {
         );
         let body = serde_json::json!({ "refresh_token": refresh_token });
         let resp = ureq::post(&url)
+            .timeout(Self::BUDGET_STANDARD)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| {
@@ -876,6 +923,7 @@ impl PlatformClient {
             "display_name": display_name,
         });
         let resp = ureq::post(&url)
+            .timeout(Self::BUDGET_STANDARD)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| match e {
@@ -899,6 +947,7 @@ impl PlatformClient {
         let url = format!("{}/accounts/me/all-keys", self.base_url);
 
         let resp = ureq::get(&url)
+            .timeout(Self::BUDGET_STANDARD)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .call()
             .map_err(|e| format!("all-keys request failed: {}", explain(&self.base_url, e)))?;
@@ -931,6 +980,7 @@ impl PlatformClient {
     pub fn resolve_cluster_node(&self) -> ClusterNodeResolution {
         let url = format!("{}/accounts/me/cluster-node", self.base_url);
         let resp = match ureq::get(&url)
+            .timeout(Self::BUDGET_STANDARD)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .call()
         {
@@ -1016,6 +1066,7 @@ impl PlatformClient {
         let url = format!("{}/virtual-keys/{}/delivery", self.base_url, virtual_key_id);
 
         let resp = ureq::get(&url)
+            .timeout(Self::BUDGET_STANDARD)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .call()
             .map_err(|e| format!("delivery request failed: {}", explain(&self.base_url, e)))?;
@@ -1030,6 +1081,7 @@ impl PlatformClient {
         let url = format!("{}/virtual-keys/{}/claim", self.base_url, virtual_key_id);
 
         ureq::post(&url)
+            .timeout(Self::BUDGET_STANDARD)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .set("Content-Type", "application/json")
             .send_string("{}")
@@ -1457,5 +1509,296 @@ mod licensed_company_name_tests {
         let inner = "AiKey  Labs   (Shenzhen)";
         let body = format!(r#"{{"schema_version":1,"company_name":"  {inner}  "}}"#);
         assert_eq!(parse_licensed_company_name(&body).as_deref(), Some(inner));
+    }
+}
+
+// ── Unbounded control-plane call ratchet (2026-09-04) ────────────────────────
+#[cfg(test)]
+mod control_plane_timeout_fence {
+    /// 🔴 Every `ureq` call to the control plane needs a time budget, or a
+    /// black-holed master (packets dropped, no RST — how a private-deployment
+    /// server fails) wedges the caller for the OS connect timeout.
+    ///
+    /// On 2026-09-04, 11 of 13 calls in this file had NO timeout. `init_cli_login`
+    /// was fixed because it is what makes aikey-tray claim "请在刚打开的浏览器窗口
+    /// 完成授权" about a window that had not opened. The other 10 were left alone
+    /// deliberately — fixing them was NOT in the approved scope, and each needs
+    /// its own budget decision (a read-only probe and a key-delivery claim do not
+    /// deserve the same number).
+    ///
+    /// So this is a RATCHET, not a wall:
+    ///   - adding an unbounded call → RED (the debt cannot grow silently)
+    ///   - bounding one still listed here → RED until it is struck off
+    ///     (the debt cannot shrink silently either — the list stays honest)
+    ///
+    /// 🔴 2026-09-04, later the same day: the user asked for the remaining 10 to
+    /// be fixed too, so the list is now EMPTY and the ratchet has become a wall
+    /// by arithmetic rather than by decree. Keep it that way — re-populating it
+    /// is allowed only for a call that is unbounded ON PURPOSE, with the reason
+    /// written next to its name. "I did not pick a number yet" is not a reason;
+    /// that is how the count reached 11 unnoticed.
+    ///
+    /// Budgets live in ONE place — `BUDGET_INTERACTIVE` / `BUDGET_STANDARD` —
+    /// so this fence never has to agree with a number typed twice.
+    const GRANDFATHERED_UNBOUNDED: &[&str] = &[];
+
+    /// Names of the functions in this file whose ureq call sets no `.timeout(`.
+    fn unbounded_callers() -> Vec<String> {
+        let src = include_str!("platform_client.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !(line.contains("ureq::post(") || line.contains("ureq::get(")) {
+                continue;
+            }
+            // The builder chain for one call never runs past a dozen lines here.
+            let end = usize::min(i + 12, lines.len());
+            if lines[i..end].iter().any(|l| l.contains(".timeout(")) {
+                continue;
+            }
+            // Walk back to the enclosing fn signature.
+            let mut name = String::from("<unknown>");
+            for j in (0..=i).rev() {
+                let t = lines[j].trim_start();
+                if let Some(rest) = t.strip_prefix("pub fn ").or_else(|| t.strip_prefix("fn ")) {
+                    name = rest
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .unwrap_or("<unknown>")
+                        .to_string();
+                    break;
+                }
+            }
+            out.push(name);
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn no_new_unbounded_control_plane_calls() {
+        let mut expected: Vec<String> =
+            GRANDFATHERED_UNBOUNDED.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        let actual = unbounded_callers();
+
+        let added: Vec<_> = actual.iter().filter(|n| !expected.contains(n)).collect();
+        assert!(
+            added.is_empty(),
+            "new control-plane call(s) with no .timeout(): {:?}\n\
+             A master that black-holes packets will wedge this call for the OS \
+             connect timeout. Give it a budget (see init_cli_login for the \
+             reasoning on picking one), or, if it is genuinely unbounded on \
+             purpose, add it to GRANDFATHERED_UNBOUNDED with a comment saying why.",
+            added
+        );
+
+        let fixed: Vec<_> = expected.iter().filter(|n| !actual.contains(n)).collect();
+        assert!(
+            fixed.is_empty(),
+            "these now have a timeout but are still listed as unbounded: {:?}\n\
+             Strike them off GRANDFATHERED_UNBOUNDED so the remaining debt stays true.",
+            fixed
+        );
+    }
+
+    #[test]
+    fn login_init_is_bounded() {
+        // The specific regression: the tray's "browser just opened" message is
+        // shown from the moment the CLI process starts, so this call's budget IS
+        // the lifetime of that false sentence.
+        assert!(
+            !unbounded_callers().iter().any(|n| n == "init_cli_login"),
+            "init_cli_login lost its timeout — aikey-tray will again claim a \
+             browser window opened while this call hangs against an unreachable \
+             master (2026-09-04 winpc2 report)."
+        );
+    }
+}
+
+// ── Control-plane budget fence (2026-09-04) ──────────────────────────────────
+#[cfg(test)]
+mod control_plane_budget_fence {
+    //! Written BEFORE the 10 remaining calls were bounded (user instruction:
+    //! "修复之前要有充分围栏测试，避免引发其他问题"), so that the fence is proven
+    //! to catch the defect rather than merely agreeing with the fix.
+    //!
+    //! Two claims, and the SECOND one is the reason this file exists:
+    //!
+    //!   1. a hung master must not hang the CLI  — RED before the fix
+    //!   2. a SLOW BUT ALIVE master must still succeed — GREEN before AND after
+    //!
+    //! Claim 2 is the regression guard. The realistic way to break this code is
+    //! not "forgot a timeout", it is "picked one that is too small", which turns
+    //! a slow private-deployment master into one nobody can sign in to — worse
+    //! than the bug being fixed. Claim 2 fails the moment a budget drops under
+    //! the server delay.
+    //!
+    //! Why timing assertions and not response fixtures: proving "the round trip
+    //! completed" needs only `elapsed >= server_delay` — had the call timed out
+    //! early it would have returned BEFORE the server ever replied. That holds
+    //! for all ten calls without building ten response shapes, so the fence does
+    //! not rot when a DTO changes.
+    //!
+    //! bugfix: workflow/CI/bugfix/2026-09-04-tray-claims-browser-opened-before-master-reached.md
+    use super::PlatformClient;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// Server delay used by the "slow but alive" claim. Comfortably longer than
+    /// any plausible LAN round trip, comfortably shorter than every budget.
+    const SLOW_REPLY: Duration = Duration::from_secs(1);
+    /// Slack over a budget before we call a bounded call "unbounded".
+    const MARGIN: Duration = Duration::from_secs(4);
+
+    /// Spawns a local server. `reply_after == None` means "accept the
+    /// connection and never answer" — the black-holed-master shape, and the
+    /// only one that reproduces an unbounded wait deterministically (an
+    /// unroutable IP would depend on the CI box's network).
+    fn spawn(reply_after: Option<Duration>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    // Drain what arrived; the request is small enough to land in
+                    // one read, and nothing here needs to parse it.
+                    let mut buf = [0u8; 8192];
+                    let _ = stream.read(&mut buf);
+                    match reply_after {
+                        Some(d) => {
+                            std::thread::sleep(d);
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                  Content-Length: 2\r\nConnection: close\r\n\r\n{}",
+                            );
+                            let _ = stream.flush();
+                        }
+                        // Hold the connection open forever: park, keeping the
+                        // stream alive. Dropping it would send EOF and the
+                        // client would return promptly — the opposite of the
+                        // situation under test.
+                        None => loop {
+                            std::thread::sleep(Duration::from_secs(3600));
+                        },
+                    }
+                });
+            }
+        });
+        base
+    }
+
+    type Call = (&'static str, fn(&str), Duration);
+
+    /// Every call in this file, paired with the budget it is meant to honour.
+    /// `init_cli_login` is included so the interactive budget is covered by the
+    /// same two claims as the rest.
+    fn calls() -> Vec<Call> {
+        vec![
+            ("init_cli_login", |b| { let _ = PlatformClient::init_cli_login(b, "v", "os"); }, PlatformClient::BUDGET_INTERACTIVE),
+            ("login", |b| { let _ = PlatformClient::login(b, "e@x.test", "p"); }, PlatformClient::BUDGET_STANDARD),
+            ("start_cli_login", |b| { let _ = PlatformClient::start_cli_login(b, "e@x.test", "v", "os"); }, PlatformClient::BUDGET_STANDARD),
+            ("poll_cli_login", |b| { let _ = PlatformClient::poll_cli_login(b, "s", "d"); }, PlatformClient::BUDGET_STANDARD),
+            ("exchange_login_token", |b| { let _ = PlatformClient::exchange_login_token(b, "s", "t"); }, PlatformClient::BUDGET_STANDARD),
+            ("do_refresh_token", |b| { let _ = PlatformClient::do_refresh_token(b, "rt"); }, PlatformClient::BUDGET_STANDARD),
+            ("register_digital_employee", |b| { let _ = PlatformClient::register_digital_employee(b, "jt", "host", "name"); }, PlatformClient::BUDGET_STANDARD),
+            ("get_all_keys", |b| { let _ = PlatformClient::new(b, "jwt").get_all_keys(); }, PlatformClient::BUDGET_STANDARD),
+            ("resolve_cluster_node", |b| { let _ = PlatformClient::new(b, "jwt").resolve_cluster_node(); }, PlatformClient::BUDGET_STANDARD),
+            ("get_key_delivery", |b| { let _ = PlatformClient::new(b, "jwt").get_key_delivery("vk"); }, PlatformClient::BUDGET_STANDARD),
+            ("claim_key", |b| { let _ = PlatformClient::new(b, "jwt").claim_key("vk"); }, PlatformClient::BUDGET_STANDARD),
+        ]
+    }
+
+    /// Runs every call against `base` in parallel and reports how long each
+    /// took. Calls that have not returned by `deadline` are reported as
+    /// unbounded rather than hanging the test run.
+    fn run_all(base: &str, deadline: Duration) -> (Vec<(String, Duration)>, Vec<String>) {
+        let (tx, rx) = mpsc::channel();
+        let mut pending: Vec<String> = Vec::new();
+        for (name, f, _) in calls() {
+            pending.push(name.to_string());
+            let tx = tx.clone();
+            let base = base.to_string();
+            // Detached on purpose: a thread stuck in an unbounded call cannot be
+            // joined, and the whole point is to report that instead of hanging.
+            std::thread::spawn(move || {
+                let t0 = Instant::now();
+                f(&base);
+                let _ = tx.send((name.to_string(), t0.elapsed()));
+            });
+        }
+        drop(tx);
+        let started = Instant::now();
+        let mut done = Vec::new();
+        while !pending.is_empty() {
+            let left = deadline.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(left) {
+                Ok((name, took)) => {
+                    pending.retain(|p| p != &name);
+                    done.push((name, took));
+                }
+                Err(_) => break,
+            }
+        }
+        (done, pending)
+    }
+
+    #[test]
+    fn slow_but_alive_master_still_succeeds() {
+        let base = spawn(Some(SLOW_REPLY));
+        let budgets = calls();
+        let (done, never_returned) = run_all(&base, Duration::from_secs(60));
+        assert!(
+            never_returned.is_empty(),
+            "these calls never came back against a server that DID answer in {:?}: {:?}",
+            SLOW_REPLY, never_returned
+        );
+        for (name, took) in done {
+            let budget = budgets.iter().find(|(n, _, _)| *n == name).map(|(_, _, b)| *b).expect("known call");
+            // The load-bearing assertion: a call that returned EARLIER than the
+            // server's reply cannot have completed the round trip — it timed
+            // out. That is the "budget too small" regression.
+            assert!(
+                took >= SLOW_REPLY,
+                "{name} returned in {took:?}, before the server replied at {SLOW_REPLY:?} — \
+                 its budget ({budget:?}) is too small, so a slow-but-alive master now looks \
+                 unreachable. That is a worse bug than the unbounded wait this fence guards."
+            );
+            assert!(
+                took < budget,
+                "{name} took {took:?}, over its own {budget:?} budget on a healthy server"
+            );
+        }
+    }
+
+    #[test]
+    fn hung_master_does_not_hang_the_cli() {
+        let base = spawn(None);
+        let budgets = calls();
+        let longest = budgets.iter().map(|(_, _, b)| *b).max().expect("non-empty");
+        let (done, never_returned) = run_all(&base, longest + MARGIN);
+        assert!(
+            never_returned.is_empty(),
+            "control-plane call(s) still unbounded against a master that accepts the \
+             connection and never answers: {:?}\n\
+             This is the 2026-09-04 winpc2 shape — the CLI waits on the OS retry \
+             budget while the UI tells the user something is happening. Give each \
+             one a budget (PlatformClient::BUDGET_STANDARD / BUDGET_INTERACTIVE).",
+            never_returned
+        );
+        for (name, took) in done {
+            let budget = budgets.iter().find(|(n, _, _)| *n == name).map(|(_, _, b)| *b).expect("known call");
+            assert!(
+                took <= budget + MARGIN,
+                "{name} took {took:?} against a hung server, past its {budget:?} budget"
+            );
+        }
     }
 }
