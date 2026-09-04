@@ -8245,7 +8245,8 @@ fn handle_hook_uninstall() -> Result<(), Box<dyn std::error::Error>> {
         // Even when nothing was wired, stale third-party CLI configs are
         // exactly as broken (no env channel) — reconcile them too.
         commands_account::reconcile_cli_configs_after_hook_uninstall();
-        commands_account::claude_desktop::restore_quiet();
+        // Claude Desktop is deliberately NOT restored here — see the note at
+        // the end of this function.
         return Ok(());
     }
     for t in &touched {
@@ -8275,14 +8276,31 @@ fn handle_hook_uninstall() -> Result<(), Box<dyn std::error::Error>> {
     // X8 (2026-07-12): codex/kimi configs that route through aikey only work
     // WITH the hook env — offer to strip them (TTY) or warn loudly (non-TTY).
     commands_account::reconcile_cli_configs_after_hook_uninstall();
-    // 阶段7 D8② (2026-07-13): Desktop is a persisted-file surface, not env-
-    // injected — left in 3p after hook uninstall it breaks silently once the
-    // proxy stops, with no diagnosable symptom in the GUI. Deliberate
-    // exception: bare `hook uninstall` also restores Desktop (soft-fail,
-    // proxy-independent; clears an `always` grant per D6 supplement).
-    // `hook uninstall openclaw` and `hook reinstall` never reach this
-    // handler — verified, no reinstall flip-flop.
-    commands_account::claude_desktop::restore_quiet();
+    // 🔴 Claude Desktop is NOT touched here (2026-09-04, reverses 阶段7 D8②).
+    //
+    // D8② made `hook uninstall` also restore Desktop to 1p. The reasoning was
+    // "Desktop left in 3p breaks silently once the proxy stops" — true, but it
+    // conflated two different events. Desktop is a persisted-file surface that
+    // talks to the proxy over HTTP; it never read the hook's env, so the hook
+    // being on or off has no bearing on whether Desktop works. Turning the
+    // shell hook off is a preference about terminals; undoing a takeover the
+    // user set up separately is a surprise, and it made the panel's Desktop
+    // toggle silently flip back whenever the hook was turned off.
+    //
+    // The case D8② was actually protecting against is UNINSTALL — there the
+    // proxy really does go away. So the restore now lives where that happens,
+    // by name, in both installers:
+    //   workflow/CD/installer/uninstall.sh   (`aikey desktop uninstall`)
+    //   workflow/CD/installer/uninstall.ps1  (Restore-ClaudeDesktop)
+    // The .ps1 side never had it at all, so this move also closes a Windows
+    // gap that existed for as long as D8② did.
+    //
+    // codex/kimi above are the opposite case and keep their reconcile: those
+    // configs route through aikey ONLY via the hook's env, so no hook means
+    // they are genuinely broken.
+    //
+    // 规则：workflow/CI/requirements/2026-07-10-claude-desktop-provider-switch.md
+    // 规则 10（取代规则 3 中的 `hook uninstall` 触发项）
     Ok(())
 }
 

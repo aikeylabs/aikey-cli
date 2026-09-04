@@ -3129,14 +3129,21 @@ fn status_integrations(vault_initialized: bool) -> Vec<serde_json::Value> {
 
     // ── 1. Shell hook — the delivery vehicle for every CLI face ─────────────
     //
-    // 🔴 This is the PARENT switch, and `depends_on` below is not decoration.
-    // handle_hook_uninstall strips the third-party configs after unwiring the
-    // rc line, and on a no-TTY child (which is what the tray spawns) it does so
-    // WITHOUT asking (mod.rs:7424). D8 additionally has it restore Claude
-    // Desktop. So turning this off turns the two below off with it — deliberately,
-    // because a hook-less machine that keeps hard-pointing configs gives new
-    // terminals `Missing environment variable: OPENAI_API_KEY` and a Desktop that
-    // fails with nothing visible in the GUI.
+    // 🔴 This is the parent switch of the CLI-shaped faces, and `depends_on`
+    // below is not decoration. handle_hook_uninstall strips the third-party CLI
+    // configs after unwiring the rc line, and on a no-TTY child (which is what
+    // the tray spawns) it does so WITHOUT asking (mod.rs:7424). Turning this off
+    // turns codex-desktop off with it — deliberately, because those configs
+    // route through aikey ONLY via the hook's env, so a hook-less machine that
+    // kept them would give new terminals `Missing environment variable:
+    // OPENAI_API_KEY`.
+    //
+    // 🔴 Claude Desktop is NOT one of them (2026-09-04, reverses D8②). It is a
+    // file surface that talks to the proxy over HTTP and never read the hook's
+    // env — it works exactly as well with the hook off. It used to be listed
+    // here because `hook uninstall` also restored it; that coupling is gone
+    // (see handle_hook_uninstall in main.rs), and the restore now lives in the
+    // uninstall scripts where the proxy actually goes away.
     let (hook_file, hook_rc, _) = crate::commands_account::hook_status_probe();
     let hook_on = hook_file && hook_rc;
 
@@ -3214,7 +3221,13 @@ fn status_integrations(vault_initialized: bool) -> Vec<serde_json::Value> {
             "switchable": true,
             "taken_over": claude_desktop_label == "taken_over",
             "state": claude_desktop_label,
-            "depends_on": "shell-hook",
+            // 🔴 Peer of the shell hook, not a child (2026-09-04). Desktop
+            // reaches the proxy over HTTP from a config file; the hook injects
+            // env into new shells. Neither needs the other. Declaring a parent
+            // here made the panel indent it AND refuse to enable it while the
+            // hook was off — a dependency the machine does not actually have.
+            // 规则 10 — workflow/CI/requirements/2026-07-10-claude-desktop-provider-switch.md
+            "depends_on": serde_json::Value::Null,
             // 拼因果，别让用户对着 Desktop 自己的错误页猜（拍板 2026-08-27）：
             // 还原失败 = 接管还活着但路由已死 —— 这是 Desktop 连不上的原因句。
             "blocked_reason": if desktop_reconcile
@@ -3901,34 +3914,107 @@ mod status_candidates_tests {
         }
     }
 
-    /// 🔴 The hierarchy fence (2026-08-18). Turning the shell hook off turns the
-    /// two desktop takeovers off with it, and that is not incidental:
-    /// handle_hook_uninstall strips the third-party configs after unwiring the rc
-    /// line, WITHOUT asking on a no-TTY child — which is exactly what the tray
-    /// spawns — and D8 has it restore Claude Desktop too. A UI that drew three
-    /// peers would let a user turn one off and watch two others follow with no
-    /// explanation, so the dependency has to travel with the data.
+    /// 🔴 The hierarchy fence (2026-08-18, revised 2026-09-04). `depends_on` is
+    /// the ONE place the parent/child relation is declared: the tray gate and
+    /// the panel indent both read it, so a wrong value here is wrong in the UI
+    /// too, with nothing else to catch it.
+    ///
+    /// The two desktop rows are deliberately ASYMMETRIC, and that asymmetry is
+    /// the whole point of this fence:
+    ///
+    /// - **codex-desktop is a child.** Its `~/.codex/config.toml` routes through
+    ///   aikey only while the hook's env is present, and handle_hook_uninstall
+    ///   strips it after unwiring the rc line — WITHOUT asking on a no-TTY child,
+    ///   which is exactly what the tray spawns. Drawing it as a peer would let a
+    ///   user turn the hook off and watch this one follow with no explanation.
+    /// - **claude-desktop is a PEER.** It is a config file that reaches the proxy
+    ///   over HTTP and never read the hook's env; it works identically with the
+    ///   hook off. It was listed as a child only because D8② had `hook uninstall`
+    ///   restore it — a cascade removed on 2026-09-04, with the restore moved to
+    ///   the uninstall scripts where the proxy actually disappears.
+    ///
+    /// 规则 10 — workflow/CI/requirements/2026-07-10-claude-desktop-provider-switch.md
+    ///
+    /// Both directions must red: re-parenting Claude Desktop reintroduces the
+    /// bug users reported (its panel toggle flipping back whenever the hook went
+    /// off), and orphaning Codex desktop hides a cascade that is still real.
     #[test]
-    fn desktop_rows_declare_the_shell_hook_as_their_parent() {
+    fn desktop_is_a_peer_of_the_shell_hook_not_a_child() {
         let rows = status_integrations(true);
-        let parent = rows
-            .iter()
-            .find(|r| r["id"] == "shell-hook")
-            .expect("shell-hook row");
+        let row = |id: &str| {
+            rows.iter()
+                .find(|r| r["id"] == id)
+                .unwrap_or_else(|| panic!("{id} row is always present"))
+                .clone()
+        };
+
         assert!(
-            parent["depends_on"].is_null(),
-            "the parent depends on nothing"
+            row("shell-hook")["depends_on"].is_null(),
+            "the hook itself depends on nothing"
         );
 
-        for id in ["claude-desktop", "codex-desktop"] {
-            let row = rows.iter().find(|r| r["id"] == id).unwrap_or_else(|| {
-                panic!("{id} row is always present");
-            });
-            assert_eq!(
-                row["depends_on"], "shell-hook",
-                "{id} is torn down with the hook and must say so"
-            );
-        }
+        assert!(
+            row("claude-desktop")["depends_on"].is_null(),
+            "Claude Desktop declared a parent again. It does not read the hook's \
+             env — re-parenting it makes the panel indent it and refuse to enable \
+             it while the hook is off, which is the defect reported on 2026-09-04."
+        );
+
+        assert_eq!(
+            row("codex-desktop")["depends_on"],
+            "shell-hook",
+            "Codex desktop lost its parent. Unlike Claude Desktop it IS torn down \
+             by `hook uninstall`, so a peer row would let a user turn the hook off \
+             and watch this one follow with no explanation."
+        );
+    }
+
+    /// 🔴 The cascade this change removed, fenced at the source rather than at
+    /// the UI. `handle_hook_uninstall` must not restore Claude Desktop: the
+    /// row above says "peer", and a data-driven UI is only as honest as the
+    /// behaviour behind it — putting `restore_quiet()` back would leave the
+    /// panel drawing a peer while the hook silently tore it down, which is
+    /// strictly worse than the parent/child drawing it replaced.
+    ///
+    /// Asserted on the SOURCE because the restore is a filesystem side effect on
+    /// the real user's machine; a behavioural test would have to take over a
+    /// Claude Desktop install to observe it.
+    #[test]
+    fn hook_uninstall_does_not_restore_claude_desktop() {
+        let src = include_str!("../main.rs");
+        let start = src
+            .find("fn handle_hook_uninstall(")
+            .expect("handle_hook_uninstall still exists");
+        // Bound the scan at the next top-level `fn ` so a restore added to a
+        // LATER function cannot keep this green (or red) by accident.
+        let end = src[start..]
+            .find("\nfn ")
+            .map(|o| start + o)
+            .unwrap_or(src.len());
+        let body: String = src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !body.contains("claude_desktop::restore"),
+            "handle_hook_uninstall restores Claude Desktop again. Turning the \
+             shell hook off is a preference about terminals; it must not undo a \
+             takeover the user set up separately. The restore belongs in \
+             workflow/CD/installer/uninstall.{{sh,ps1}}, where the proxy that \
+             Desktop points at is actually being removed."
+        );
+        // The codex/kimi reconcile is the opposite case and must SURVIVE — those
+        // configs really do stop working without the hook's env. Removing it
+        // here would be the mirror-image regression (X8, 2026-07-12).
+        assert!(
+            body.contains("reconcile_cli_configs_after_hook_uninstall"),
+            "the codex/kimi reconcile disappeared from hook uninstall; those \
+             configs route through aikey ONLY via the hook env, so a hook-less \
+             machine that keeps them gives new terminals \
+             `Missing environment variable: OPENAI_API_KEY` (X8)."
+        );
     }
 
     /// 🔴 The Codex desktop row governs the IDE extension too, because both are
