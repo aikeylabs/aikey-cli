@@ -109,6 +109,17 @@ pub(crate) enum Commands {
     /// behind the binary's embedded template). Output format is a bare
     /// 16-hex-digit hash on stdout — kept minimal so the shell can compare
     /// it with a trivial `[[ "$a" == "$b" ]]`.
+    /// Internal: the MCP delegation-boundary hook (P15 · task 15.6).
+    ///
+    /// Claude Code invokes this with the hook event on stdin and reads the
+    /// decision from stdout. 🔴 A SHELL — it decodes, asks the running gateway,
+    /// and encodes the answer back. The tier rules live in the gateway so the
+    /// console preview and this hook cannot drift apart.
+    ///
+    /// 🔴 Top-level rather than under `_internal`: that group requires
+    /// `--stdin-json`, and the harness invokes this with no arguments.
+    #[command(hide = true, name = "_mcp-guard-hook")]
+    McpGuardHook,
     #[command(hide = true, name = "_hook-hash")]
     HookHash {
         /// Which shell template to hash: zsh | bash
@@ -1499,6 +1510,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
         None => "unknown".to_string(),
         Some(c) => match c {
             Commands::Init => "init".to_string(),
+            Commands::McpGuardHook => "_mcp-guard-hook".to_string(),
             // 🔴 The SUBcommand is named, never its arguments: a backend name is
             // user data and a credential alias is a hint about their
             // infrastructure. Neither belongs in a log field.
@@ -1509,7 +1521,14 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                     McpCommands::List => "list",
                     McpCommands::Remove { .. } => "remove",
                     McpCommands::Test { .. } => "test",
+                    McpCommands::Try { .. } => "try",
+                    McpCommands::Calls { .. } => "calls",
                     McpCommands::Scan => "scan",
+                    // 🔴 The ACTION is named, not whether it succeeded: whether a
+                    // machine has the delegation gate installed is a fact about
+                    // that machine's governance posture, and a log field is the
+                    // wrong place to publish it.
+                    McpCommands::Guard { .. } => "guard",
                     McpCommands::Review { .. } => "review",
                     McpCommands::Adopt { .. } => "adopt",
                 }
@@ -3563,6 +3582,72 @@ pub enum McpCommands {
         /// Only report this backend (omit for all).
         name: Option<String>,
     },
+    /// Call one tool through the gateway, as yourself — a self-check
+    ///
+    /// 🔴 Goes through the RUNNING gateway on this machine, with your own key,
+    /// so the call is authorised, validated, recorded and charged exactly like
+    /// one your Agent makes. It cannot do anything your Agent could not.
+    ///
+    /// The result also lands in `aikey mcp calls`, marked as a self-check.
+    Try {
+        /// The tool to call, as `aikey mcp try <tool>` — run with a wrong name
+        /// to see what this toolset exposes.
+        #[arg(value_name = "TOOL")]
+        tool: String,
+        /// One argument, written NAME=VALUE. Repeat for each.
+        ///
+        /// Values are typed from the tool's own published schema, so
+        /// `--arg limit=10` becomes the number 10 only if the tool says that
+        /// argument is a number.
+        ///
+        /// 🚫 Do not put a secret here: the command line is visible to other
+        /// users on this machine and lands in your shell history. Use
+        /// --args-json with a value read from a file if you must.
+        #[arg(long = "arg", value_name = "NAME=VALUE")]
+        arg: Vec<String>,
+        /// The whole arguments object as JSON, for anything --arg cannot spell.
+        #[arg(long, value_name = "JSON", conflicts_with = "arg")]
+        args_json: Option<String>,
+        /// Which toolset to call through. Defaults to `local`, which is the one
+        /// Personal exposes; on Production use the slug from your client config.
+        #[arg(long, value_name = "SLUG", default_value = "local")]
+        slug: String,
+        /// Which of your keys to call as. Omit to use the first one.
+        #[arg(long, value_name = "ALIAS")]
+        key: Option<String>,
+    },
+    /// Show this machine's own record of MCP tool calls
+    ///
+    /// 🔴 Reads the proxy's local database directly and READ-ONLY, so it works
+    /// whether or not the proxy is running and never locks its WAL.
+    ///
+    /// On Personal this is the audit trail — there is no control plane to ship
+    /// it to. On Production it is only what THIS machine did; the organisation's
+    /// history lives in the console.
+    ///
+    /// Argument VALUES are never shown, only their shape.
+    #[command(alias = "log")]
+    Calls {
+        /// How many of the most recent calls to show.
+        #[arg(long, default_value_t = 20, value_name = "N")]
+        limit: usize,
+        /// Only calls of this tool.
+        #[arg(long, value_name = "NAME")]
+        tool: Option<String>,
+        /// Only calls that did not succeed — refusals, freezes, backend errors.
+        #[arg(long)]
+        failed: bool,
+    },
+    /// Install, inspect or remove the delegation boundary — the gate that
+    /// decides whether an agent may spawn a sub-agent.
+    ///
+    /// 🔴 It gates SPAWNING. It does not restrict what an already-running
+    /// sub-agent may call: the tool requests carry no agent identity, so the
+    /// gateway sees only the seat.
+    Guard {
+        #[command(subcommand)]
+        action: McpGuardAction,
+    },
     /// Report the MCP servers already configured on this machine, and which
     /// of them carry a credential in cleartext.
     ///
@@ -3615,5 +3700,35 @@ pub enum McpCommands {
         /// changes, it is hidden and refused until you accept.
         #[arg(long, value_name = "SERVER/TOOL")]
         write: Option<String>,
+    },
+}
+
+/// `aikey mcp guard <action>` — see `McpCommands::Guard`.
+#[derive(Subcommand, Debug)]
+pub enum McpGuardAction {
+    /// Register the delegation hook in Claude Code's settings.json
+    Install,
+    /// Show whether the hook is registered AND whether the gateway answers
+    ///
+    /// 🔴 Both, because either alone misleads: a registered hook whose gateway
+    /// is unreachable allows every spawn, and from the outside that is
+    /// indistinguishable from a working gate.
+    Status,
+    /// Remove the delegation hook (leaves every other setting alone)
+    Uninstall,
+    /// Show what the gate would decide for one sub-agent type — 🔴 READ-ONLY
+    ///
+    /// Asks the SAME gateway endpoint the live hook asks, so what this prints
+    /// is what the gate will actually do. 🚫 It writes nothing: not
+    /// settings.json, not your agent definitions.
+    Preview {
+        /// The harness sub-agent type, e.g. Explore or general-purpose
+        #[arg(value_name = "AGENT_TYPE")]
+        agent_type: String,
+        /// Where the child would sit. 1 = spawned by the main agent.
+        #[arg(long, default_value_t = 1)]
+        depth: i64,
+        #[arg(long)]
+        json: bool,
     },
 }

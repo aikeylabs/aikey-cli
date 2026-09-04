@@ -56,6 +56,7 @@ mod proxy_state;
 // migrations module is in lib.rs (used by both main.rs and executor.rs)
 use aikeylabs_aikey_cli::commands_app;
 use aikeylabs_aikey_cli::commands_audit;
+use aikeylabs_aikey_cli::mcp_try;
 use aikeylabs_aikey_cli::migrations;
 use aikeylabs_aikey_cli::provider_selfdesc as selfdesc;
 #[allow(dead_code)]
@@ -68,6 +69,8 @@ mod commands_compliance;
 mod commands_import;
 mod commands_init;
 mod commands_internal;
+mod mcp_guard;
+mod mcp_harness;
 mod commands_service;
 mod commands_statusline;
 mod commands_trust;
@@ -1473,6 +1476,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         // Hidden: print the embedded hook-template hash so the precmd
         // drift-check can compare against the on-disk hook file header.
+        // P15 · the delegation boundary hook. 🔴 A SHELL: it decodes the harness
+        // event, asks the running gateway, encodes the answer back. No policy
+        // lives here — see src/mcp_guard.rs and
+        // principles/internal-command-reuses-public-core.md.
+        Commands::McpGuardHook => mcp_guard::cmd_hook()?,
         Commands::HookHash { shell } => {
             let kind = match shell.as_str() {
                 "zsh" => commands_account::HookKind::Zsh,
@@ -4910,9 +4918,38 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             cli::McpCommands::List => commands_mcp::cmd_list(cli.json)?,
             cli::McpCommands::Remove { name } => commands_mcp::cmd_remove(name, cli.json)?,
             cli::McpCommands::Test { name } => commands_mcp::cmd_test(name.as_deref(), cli.json)?,
+            cli::McpCommands::Try {
+                tool,
+                arg,
+                args_json,
+                slug,
+                key,
+            } => mcp_try::cmd_try(mcp_try::TryRequest {
+                tool,
+                slug,
+                key: key.as_deref(),
+                args: arg,
+                args_json: args_json.as_deref(),
+                json: cli.json,
+            })?,
+            cli::McpCommands::Calls {
+                limit,
+                tool,
+                failed,
+            } => commands_mcp::cmd_calls(*limit, tool.as_deref(), *failed, cli.json)?,
             // 阶段8 P14 task 14.1 — read-only inventory. It is in this match
             // arm's zero-password group by construction: it never reaches the
             // password closure above, because it never touches the vault.
+            cli::McpCommands::Guard { action } => match action {
+                cli::McpGuardAction::Install => mcp_guard::cmd_install(cli.json)?,
+                cli::McpGuardAction::Status => mcp_guard::cmd_status(cli.json)?,
+                cli::McpGuardAction::Uninstall => mcp_guard::cmd_uninstall(cli.json)?,
+                cli::McpGuardAction::Preview {
+                    agent_type,
+                    depth,
+                    json,
+                } => mcp_guard::cmd_preview(agent_type, *depth, *json || cli.json)?,
+            },
             cli::McpCommands::Scan => mcp_scan::cmd_scan(cli.json)?,
             // 阶段8 P14 task 14.2 — the only branch in this match that writes
             // to the user's home directory, and the only one that may ask for

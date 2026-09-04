@@ -32,6 +32,7 @@ pub mod local_server_diagnose;
 pub mod local_server_probe;
 pub mod mcp_adopt;
 pub mod mcp_scan;
+pub mod mcp_try;
 pub mod migrations;
 pub mod observability;
 pub mod platform_client;
