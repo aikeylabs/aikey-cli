@@ -29,6 +29,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
+use crate::commands_account::third_party_config as tp;
+
 /// aikey's own gateway profile id. Trailing 12 hex = ASCII "AIKEY";
 /// v4/variant-8 legal shape. NEVER change once released — restore and
 /// ownership detection key off this exact file name / appliedId.
@@ -341,6 +343,14 @@ pub(crate) enum DesktopState {
     /// `3p` but applied by someone else (e.g. cc-switch). D5: silent
     /// takeover is allowed; their profile FILE is never touched.
     ForeignActive,
+    /// The normal config exists but cannot be parsed (2026-09-05, third-party
+    /// config guard Phase 4). Its own state: before this it fell through
+    /// `deployment_mode() == None` and reported OFFICIAL — a file that
+    /// plainly exists and is broken was described as "not taken over", and
+    /// every write path then either refused (takeover) or rewrote around it
+    /// (restore). Every write refuses; `aikey desktop status` / the tray row
+    /// show the guard sentence; repair is `hook repair claude-desktop --from-backup`.
+    ConfigInvalid,
     /// `3p` with NOBODY's profile applied — no appliedId and no profile file
     /// in the library. This is RESIDUE, not a foreign takeover (2026-08-31,
     /// winpc2). Distinguishing it matters because ForeignActive carries a
@@ -406,6 +416,11 @@ pub(crate) fn detect_state(paths: &DesktopPaths) -> DesktopState {
     }
     // The NORMAL config is the authoritative mode switch (the app reads it
     // in both modes; the 3p copy exists for the 3p bundle's own view).
+    // A normal config that exists but does not parse is ITS OWN state —
+    // never "official" (spec: R-third-party-config-guard-6.S1).
+    if paths.normal_config.is_file() && read_json_object(&paths.normal_config).is_err() {
+        return DesktopState::ConfigInvalid;
+    }
     let mode_3p = deployment_mode(&paths.normal_config).as_deref() == Some("3p");
     if !mode_3p {
         return DesktopState::Official;
@@ -476,13 +491,117 @@ impl Snapshot {
     fn restore(&self) {
         match &self.content {
             Some(bytes) => {
-                let _ = crate::profile_activation::atomic_write(&self.path, bytes);
+                let _ = tp::commit(&self.path, Some(bytes));
             }
             None => {
-                let _ = std::fs::remove_file(&self.path);
+                let _ = tp::commit(&self.path, None);
             }
         }
     }
+}
+
+/// Every Desktop write goes through the guard's one door with a versioned
+/// backup of whatever was there first (Phase 4, 2026-09-05). The four-file
+/// snapshot rollback in `takeover_at` stays on top of this.
+fn write_json_guarded(path: &Path, value: &Value) -> Result<(), String> {
+    let pretty = serde_json::to_string_pretty(value)
+        .map_err(|e| format!("serialize {}: {}", path.display(), e))?;
+    if path.is_file() {
+        tp::backup_versioned(path).map_err(|e| format!("back up {}: {}", path.display(), e))?;
+    }
+    tp::commit(path, Some(pretty.as_bytes()))
+        .map_err(|e| format!("write {}: {}", path.display(), e))
+}
+
+fn delete_guarded(path: &Path) -> Result<(), String> {
+    if path.is_file() {
+        tp::backup_versioned(path).map_err(|e| format!("back up {}: {}", path.display(), e))?;
+    }
+    tp::commit(path, None).map_err(|e| format!("remove {}: {}", path.display(), e))
+}
+
+/// The guard's view of the NORMAL config (the authoritative mode switch):
+/// strict parse → sentence, versioned backups, `hook repair claude-desktop
+/// --from-backup`. Merge/remove are NOT routed through `apply` — the takeover
+/// is a four-file transaction with its own snapshot rollback (`takeover_at`),
+/// which the design keeps; every one of its writes goes through `tp::commit`.
+pub(crate) struct DesktopSurface {
+    normal_config: PathBuf,
+}
+
+impl DesktopSurface {
+    pub(crate) fn at(paths: &DesktopPaths) -> Self {
+        DesktopSurface {
+            normal_config: paths.normal_config.clone(),
+        }
+    }
+}
+
+impl tp::Surface for DesktopSurface {
+    type Doc = Value;
+    type Input = ();
+
+    const ID: tp::SurfaceId = tp::SurfaceId::ClaudeDesktop;
+    const FORMAT: tp::Format = tp::Format::Json;
+    const CREATE: tp::CreatePolicy = tp::CreatePolicy::RequireInstalled;
+    const FOREIGN: tp::ForeignPolicy = tp::ForeignPolicy::ClaimWithConsent;
+    const OWNED_GRAMMAR: Option<&'static tp::OwnedTomlGrammar> = None;
+
+    fn path(&self) -> PathBuf {
+        self.normal_config.clone()
+    }
+    fn load(&self, text: &str) -> Result<Self::Doc, tp::ParseFailure> {
+        let v = tp::parse_json_strict(text)?;
+        if !v.is_object() {
+            return Err(tp::ParseFailure {
+                line: Some(1),
+                col: Some(1),
+                msg: "top level is not a JSON object".into(),
+            });
+        }
+        Ok(v)
+    }
+    fn empty_doc(&self) -> Self::Doc {
+        json!({})
+    }
+    fn detect(&self, doc: &Self::Doc) -> tp::Detection {
+        let mode_3p = doc.get("deploymentMode").and_then(|m| m.as_str()) == Some("3p");
+        tp::Detection::of(if mode_3p {
+            tp::TpConfigState::OursActive
+        } else {
+            tp::TpConfigState::PresentNoAikey
+        })
+    }
+    fn merge(&self, _doc: Self::Doc, _input: &Self::Input) -> Result<Self::Doc, String> {
+        Err(
+            "Claude Desktop is written by takeover_at (four-file transaction), never by apply"
+                .into(),
+        )
+    }
+    fn remove(&self, doc: Self::Doc) -> Self::Doc {
+        doc
+    }
+    fn render(&self, doc: &Self::Doc) -> String {
+        serde_json::to_string_pretty(doc).unwrap_or_default()
+    }
+    fn expected_after_merge(&self, _det: &tp::Detection, _input: &Self::Input) -> bool {
+        false
+    }
+}
+
+pub(crate) fn desktop_inspection_at(paths: &DesktopPaths) -> tp::Inspection {
+    tp::inspect(&DesktopSurface::at(paths))
+}
+
+/// `None` on platforms without a Claude Desktop build.
+pub(crate) fn desktop_inspection() -> Option<tp::Inspection> {
+    desktop_paths().map(|p| desktop_inspection_at(&p))
+}
+
+fn config_invalid_sentence(paths: &DesktopPaths) -> String {
+    desktop_inspection_at(paths)
+        .unparseable_sentence()
+        .unwrap_or_else(|| format!("{} cannot be read", paths.normal_config.display()))
 }
 
 /// Flip `deploymentMode` in one config file, preserving every other key.
@@ -496,10 +615,7 @@ fn write_deployment_mode(config_path: &Path, mode: &str) -> Result<(), String> {
         json!({})
     };
     obj["deploymentMode"] = Value::String(mode.to_string());
-    let pretty = serde_json::to_string_pretty(&obj)
-        .map_err(|e| format!("serialize {}: {}", config_path.display(), e))?;
-    crate::profile_activation::atomic_write(config_path, pretty.as_bytes())
-        .map_err(|e| format!("write {}: {}", config_path.display(), e))
+    write_json_guarded(config_path, &obj)
 }
 
 /// Claim `_meta.json`'s `appliedId` (D5: taking over a foreign 3p setup
@@ -511,10 +627,7 @@ fn write_meta_applied(meta_path: &Path) -> Result<(), String> {
         json!({})
     };
     obj["appliedId"] = Value::String(PROFILE_ID.to_string());
-    let pretty = serde_json::to_string_pretty(&obj)
-        .map_err(|e| format!("serialize {}: {}", meta_path.display(), e))?;
-    crate::profile_activation::atomic_write(meta_path, pretty.as_bytes())
-        .map_err(|e| format!("write {}: {}", meta_path.display(), e))
+    write_json_guarded(meta_path, &obj)
 }
 
 /// Take over Claude Desktop at `paths` (test-injectable). All-or-nothing:
@@ -535,6 +648,9 @@ pub(crate) fn takeover_at(
         DesktopInstallation::Legacy | DesktopInstallation::Msix => {}
     }
 
+    if detect_state(paths) == DesktopState::ConfigInvalid {
+        return Err(config_invalid_sentence(paths));
+    }
     let profile_json = build_gateway_profile(material);
     let profile_pretty = serde_json::to_string_pretty(&profile_json)
         .map_err(|e| format!("serialize profile: {}", e))?;
@@ -576,8 +692,7 @@ pub(crate) fn takeover_at(
     ];
 
     let result = (|| -> Result<(), String> {
-        crate::profile_activation::atomic_write(&paths.profile, profile_pretty.as_bytes())
-            .map_err(|e| format!("write {}: {}", paths.profile.display(), e))?;
+        write_json_guarded(&paths.profile, &profile_json)?;
         // Cluster profiles carry a real vk_token (risk 3) — owner-only.
         // Windows: inherits the user-dir ACL (no 0600 there, D10⑤).
         #[cfg(unix)]
@@ -616,6 +731,7 @@ pub(crate) fn restore_at(paths: &DesktopPaths) -> Result<RestoreResult, String> 
             _ => "Claude Desktop installation detection failed".to_string(),
         }),
         DesktopState::ForeignActive => Ok(RestoreResult::NotOursSkipped),
+        DesktopState::ConfigInvalid => Err(config_invalid_sentence(paths)),
         // Our own residue (mode=3p, nobody's profile). Same treatment as
         // OursActive: write 1p back and clear what is left. Skipping it —
         // which is what the pre-2026-08-31 ForeignActive verdict caused —
@@ -657,17 +773,13 @@ pub(crate) fn restore_at(paths: &DesktopPaths) -> Result<RestoreResult, String> 
 fn remove_our_residue(paths: &DesktopPaths) -> Result<bool, String> {
     let mut removed = false;
     if paths.profile.exists() {
-        std::fs::remove_file(&paths.profile)
-            .map_err(|e| format!("remove {}: {}", paths.profile.display(), e))?;
+        delete_guarded(&paths.profile)?;
         removed = true;
     }
     if applied_id(&paths.meta).as_deref() == Some(PROFILE_ID) {
         let mut obj = read_json_object(&paths.meta)?;
         obj.as_object_mut().map(|m| m.remove("appliedId"));
-        let pretty = serde_json::to_string_pretty(&obj)
-            .map_err(|e| format!("serialize {}: {}", paths.meta.display(), e))?;
-        crate::profile_activation::atomic_write(&paths.meta, pretty.as_bytes())
-            .map_err(|e| format!("write {}: {}", paths.meta.display(), e))?;
+        write_json_guarded(&paths.meta, &obj)?;
         removed = true;
     }
     Ok(removed)
@@ -880,6 +992,15 @@ pub(crate) fn reconcile_active_at(
             DesktopSwitch::default()
         }
         DesktopState::OursActive => perform_takeover(paths, proxy_port),
+        DesktopState::ConfigInvalid => {
+            // Say why, once per pass; never write. The row / `desktop status`
+            // carry the same sentence.
+            eprintln!("  ! {}", config_invalid_sentence(paths));
+            DesktopSwitch {
+                detected: true,
+                ..Default::default()
+            }
+        }
         // Our own residue takes the consent path like Official does: there is
         // no third party to surprise, and a fresh takeover overwrites the
         // orphan cleanly (2026-08-31).
@@ -1061,6 +1182,7 @@ pub(crate) fn handle_desktop_status(json_mode: bool) -> Result<(), Box<dyn std::
                 DesktopState::Official => "official",
                 DesktopState::OursActive => "aikey",
                 DesktopState::ForeignActive => "other",
+                DesktopState::ConfigInvalid => "config-invalid",
                 // Says what it is, not who owns it: "other" sent a 2026-08-31
                 // diagnosis down the wrong path ("another tool took it over")
                 // when the truth was our own leftovers.
@@ -1912,6 +2034,123 @@ mod tests {
     fn read_mode(p: &std::path::Path) -> String {
         let v: Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
         v["deploymentMode"].as_str().unwrap().to_string()
+    }
+
+    // ── Phase 4 (third-party config guard, 2026-09-05) ──────────────────
+    // spec: R-third-party-config-guard-6
+
+    /// A normal config that exists but does not parse is ITS OWN state and
+    /// every write path refuses it — before, it read as Official and the
+    /// takeover/restore either errored late or wrote around it.
+    #[test]
+    fn config_invalid_is_its_own_state_and_every_write_refuses() {
+        let tmp = TempDir::new().unwrap();
+        let paths = installed_paths(&tmp);
+        std::fs::write(&paths.normal_config, "{ \"deploymentMode\": \"3p\", ").unwrap();
+        let before = std::fs::read(&paths.normal_config).unwrap();
+
+        assert_eq!(detect_state(&paths), DesktopState::ConfigInvalid);
+        let err = takeover_at(&paths, &material()).expect_err("takeover must refuse");
+        assert!(err.contains("is not valid JSON at line "), "{err}");
+        assert!(
+            err.contains("fix the file by hand"),
+            "no backup yet → hand repair: {err}"
+        );
+        let err = restore_at(&paths).expect_err("restore must refuse");
+        assert!(err.contains("is not valid JSON"), "{err}");
+        assert_eq!(reconcile_stale_at(&paths, 27200), StaleReconcile::NoAction);
+        let sw = reconcile_active_at(&paths, 27200, false);
+        assert_eq!(
+            sw,
+            DesktopSwitch {
+                detected: true,
+                ..Default::default()
+            }
+        );
+
+        assert_eq!(
+            std::fs::read(&paths.normal_config).unwrap(),
+            before,
+            "bytes untouched"
+        );
+        // (TP_COMMITS is process-global and other suites write concurrently;
+        // "the door never opened" is asserted by the four files' bytes and
+        // the absence of any backup instead.)
+        assert!(!paths.profile.exists() && !paths.meta.exists() && !paths.threep_config.exists());
+        assert!(tp::list_backups(&paths.normal_config).is_empty());
+        let insp = desktop_inspection_at(&paths);
+        assert_eq!(
+            insp.unparseable_sentence().as_deref(),
+            Some(err.as_str()),
+            "one sentence everywhere"
+        );
+    }
+
+    /// Every Desktop write goes through the guard's one door and leaves a
+    /// versioned backup of what was there; the explicit restore brings the
+    /// pre-aikey normal config back byte for byte.
+    #[test]
+    fn takeover_and_restore_leave_versioned_backups_through_the_one_door() {
+        let tmp = TempDir::new().unwrap();
+        let paths = installed_paths(&tmp);
+        let pre = "{\n  \"theme\": \"x\"\n}";
+        std::fs::write(&paths.normal_config, pre).unwrap();
+
+        assert_eq!(
+            takeover_at(&paths, &material()).unwrap(),
+            TakeoverResult::Installed
+        );
+        // "all four through the one door" is fenced at the source level
+        // (third_party_write_guard_fence: this file has no atomic_write left).
+        let normal_backups = tp::list_backups(&paths.normal_config);
+        assert_eq!(normal_backups.len(), 1, "{normal_backups:?}");
+        assert_eq!(
+            std::fs::read_to_string(&normal_backups[0]).unwrap(),
+            pre,
+            "backup is the pre-aikey file"
+        );
+        assert!(
+            tp::list_backups(&paths.profile).is_empty(),
+            "nothing existed to back up"
+        );
+        assert_eq!(read_mode(&paths.normal_config), "3p");
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.normal_config).unwrap()).unwrap();
+        assert_eq!(v["theme"], "x", "other keys preserved");
+
+        assert_eq!(restore_at(&paths).unwrap(), RestoreResult::Restored);
+        assert_eq!(read_mode(&paths.normal_config), "1p");
+        assert_eq!(
+            tp::list_backups(&paths.normal_config).len(),
+            2,
+            "restore backed up the 3p state too"
+        );
+        assert_eq!(
+            tp::list_backups(&paths.profile).len(),
+            1,
+            "the deleted profile was backed up first"
+        );
+        assert!(!paths.profile.exists());
+
+        // Explicit restore of the ORIGINAL normal config (not the newest backup).
+        let r = tp::repair(
+            &DesktopSurface::at(&paths),
+            tp::RepairMode::FromBackup(Some(normal_backups[0].clone())),
+            true,
+        );
+        assert_eq!(
+            r.outcome.as_ref().unwrap().action,
+            tp::TpAction::Restored,
+            "{:?}",
+            r.outcome
+        );
+        assert_eq!(std::fs::read_to_string(&paths.normal_config).unwrap(), pre);
+        // and text-stripping is never offered for JSON
+        let r = tp::repair(&DesktopSurface::at(&paths), tp::RepairMode::StripOurs, true);
+        assert_eq!(
+            r.outcome.as_ref().unwrap().reason_code,
+            Some(tp::ReasonCode::TpNotApplicable)
+        );
     }
 
     // 1 · fresh takeover: 4 files correct; profile 0600 (unix); meta ours

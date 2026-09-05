@@ -15,6 +15,7 @@ pub mod commands_proxy;
 pub mod config;
 pub mod connectivity;
 pub mod control_plane_error;
+pub mod credential_input;
 pub mod credential_type;
 pub mod crypto;
 pub mod display_language;

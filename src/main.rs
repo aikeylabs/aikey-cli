@@ -9,6 +9,7 @@ mod config;
 mod connectivity;
 #[allow(dead_code)]
 mod control_plane_error;
+mod credential_input;
 mod credential_type;
 mod crypto;
 #[allow(dead_code)]
@@ -4401,6 +4402,17 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("  {} {}", name, path.display().to_string().dimmed());
                         }
                     }
+                    // A config aikey cannot read is LISTED, not hidden (2026-09-05):
+                    // the guard refuses to touch it, so this is where a user learns
+                    // why `aikey use` stopped configuring the tool — and how to fix it.
+                    let unreadable = commands_account::unreadable_provider_configs();
+                    if !unreadable.is_empty() {
+                        eprintln!();
+                        eprintln!("{}", "Provider configs aikey cannot read:".bold());
+                        for (name, _path, sentence) in &unreadable {
+                            eprintln!("  {} {}", name, sentence.yellow());
+                        }
+                    }
                 }
                 Some(EnvAction::Set { args }) => {
                     // `aikey env set -- KEY=VALUE ...`
@@ -8112,6 +8124,28 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             }
         }
         HookAction::Reinstall { shell } => handle_hook_reinstall(shell.as_deref()),
+        HookAction::Repair {
+            target,
+            strip_ours,
+            from_backup,
+            yes,
+            json,
+        } => {
+            // `--from-backup` with no value = newest aikey backup.
+            let from_backup = from_backup.as_ref().map(|p| {
+                if p.is_empty() {
+                    None
+                } else {
+                    Some(std::path::PathBuf::from(p))
+                }
+            });
+            let code =
+                commands_account::hook_repair(target, *strip_ours, from_backup, *yes, *json)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         HookAction::Uninstall { target } => match target.as_deref() {
             Some("openclaw") => commands_account::openclaw_hook::uninstall().map_err(|e| e.into()),
             // 🔴 The per-tool reverse of `aikey hook install codex` (2026-08-18).
@@ -8133,8 +8167,19 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             // and `aikey hook install codex` remains the documented way back
             // (running it IS actionable consent, per the 2026-07-16 rule).
             Some("codex") => {
-                commands_account::unconfigure_codex_cli();
+                let outcome = commands_account::unconfigure_codex_cli();
                 global_config::set_codex_consent_never()?;
+                // The guard already printed WHY it refused (unparseable file…).
+                // Do not print a success line over it — that is how the
+                // 2026-09-04 incident stayed invisible. The preference still
+                // flips: the user asked for "never", and that part happened.
+                if outcome.refused() {
+                    eprintln!(
+                        "  Codex consent set to never, but its config was left as is (see above). \
+Run `aikey hook repair codex` to see how to fix the file."
+                    );
+                    std::process::exit(2);
+                }
                 eprintln!(
                     "  {} Codex takeover removed. Run `aikey hook install codex` to allow it again.",
                     crate::symbols::CHECK.s()

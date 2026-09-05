@@ -4,7 +4,8 @@
 
 use colored::Colorize;
 use std::io;
-use std::path::Path;
+
+use super::third_party_config as tp;
 
 // ---------------------------------------------------------------------------
 // Kimi CLI auto-configuration
@@ -27,8 +28,8 @@ use std::path::Path;
 // the new region; otherwise we leave the old blocks intact and append — the
 // user can reconcile manually if Kimi rejects duplicate keys.
 
-const AIKEY_BEGIN: &str = "# BEGIN aikey (do not hand-edit between markers)";
-const AIKEY_END: &str = "# END aikey";
+pub(super) const AIKEY_BEGIN: &str = "# BEGIN aikey (do not hand-edit between markers)";
+pub(super) const AIKEY_END: &str = "# END aikey";
 const LEGACY_MARKER: &str = "# managed by aikey";
 
 /// Build the aikey-managed Kimi config region (hook-only minimal scaffold).
@@ -51,40 +52,29 @@ const LEGACY_MARKER: &str = "# managed by aikey";
 /// build time depends on the aikey binary absolute path (which is derived
 /// from `current_exe()` independently of proxy_port). The proxy port is no
 /// longer embedded in this region — it's only referenced via env vars.
-/// Strip `default_model = "..."` lines at the top-level (outside any table)
-/// that were originally written by old aikey versions when the scaffold still
-/// included `[models.kimi-k2-5]`. After shrinking the region to hooks-only,
-/// a leftover `default_model = "kimi-k2-5"` line would fail Kimi's
-/// cross-validation (Default model not found in models).
-///
-/// Conservative: only strip if the value matches the known aikey defaults
-/// (`kimi-k2-5`, `moonshot-v1-128k`). User-chosen values (e.g. `kimi-dev`)
-/// are preserved — we assume they wrote those themselves.
-fn strip_legacy_kimi_default_model(content: &str) -> String {
-    const AIKEY_LEGACY_DEFAULTS: &[&str] = &["kimi-k2-5", "moonshot-v1-128k"];
-    let mut out = String::with_capacity(content.len());
-    let mut seen_table = false;
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('[') {
-            seen_table = true;
-        }
-        // Only strip if: before any [table] header, AND matches `default_model = "<legacy>"`.
-        // Inside a table, `default_model` could be a sub-key (e.g. `[something]\ndefault_model = ...`)
-        // and we shouldn't touch those.
-        let is_our_legacy = !seen_table
-            && trimmed.starts_with("default_model")
-            && AIKEY_LEGACY_DEFAULTS.iter().any(|v| {
-                trimmed.contains(&format!("= \"{}\"", v))
-                    || trimmed.contains(&format!("=\"{}\"", v))
-            });
-        if is_our_legacy {
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
+/// Old aikey versions wrote a top-level `default_model = "<aikey default>"`
+/// pointing at a `[models.*]` block the scaffold no longer creates; a leftover
+/// fails Kimi's cross-validation (Default model not found in models). Ours
+/// only when the value is one of OUR historical defaults — a user-chosen
+/// value (`kimi-dev`) is theirs and stays. Structural (on the parsed
+/// document) since 2026-09-05; the text-level twin lives only in the repair
+/// grammar (`KIMI_OWNED_GRAMMAR`).
+const AIKEY_LEGACY_KIMI_DEFAULTS: &[&str] = &["kimi-k2-5", "moonshot-v1-128k"];
+
+fn kimi_value_is_legacy_default(v: &str) -> bool {
+    AIKEY_LEGACY_KIMI_DEFAULTS.contains(&v)
+}
+
+fn kimi_drop_legacy_default_model(doc: &mut toml_edit::Document) -> bool {
+    let ours = doc
+        .get("default_model")
+        .and_then(|i| i.as_str())
+        .map(kimi_value_is_legacy_default)
+        .unwrap_or(false);
+    if ours {
+        doc.as_table_mut().remove("default_model");
     }
-    out
+    ours
 }
 
 // ---------------------------------------------------------------------------
@@ -112,47 +102,7 @@ fn strip_legacy_kimi_default_model(content: &str) -> String {
 /// the command's stable tail rather than a text marker comment, because a
 /// structural merge doesn't preserve arbitrary comment placement — semantic
 /// identity is more robust than a `# BEGIN aikey` text marker.
-const KIMI_HOOK_COMMAND_MARKER: &str = "statusline render kimi";
-
-/// Parse `content` as TOML, self-healing a file we previously corrupted.
-///
-/// Returns `None` only when the file is invalid TOML for a reason we did NOT
-/// cause — in that case the caller must NOT touch it (backup + WARN), because
-/// blindly rewriting could destroy user content we can't understand.
-///
-/// Self-heal path: our historical bug left a `# BEGIN aikey … [[hooks]] … # END
-/// aikey` region alongside a foreign `hooks = []`, which is unparseable. We
-/// strip our own marker region first (`strip_managed_region`) and retry — after
-/// removing our block the remaining file is the tool's own valid TOML, which we
-/// then merge into cleanly. This makes existing broken installs self-heal on
-/// the next `aikey use`.
-fn parse_or_heal_toml(content: &str) -> Option<toml_edit::Document> {
-    if let Ok(doc) = content.parse::<toml_edit::Document>() {
-        return Some(doc);
-    }
-    // Attempt 2: strip our own marker region(s) then re-parse.
-    let mut healed = content.to_string();
-    while let Some(stripped) = strip_managed_region(&healed) {
-        healed = stripped;
-    }
-    // Also drop any legacy single-line-marked rows before re-parsing.
-    let healed: String = healed
-        .lines()
-        .filter(|l| !l.contains(LEGACY_MARKER))
-        .collect::<Vec<_>>()
-        .join("\n");
-    healed.parse::<toml_edit::Document>().ok()
-}
-
-/// Layer-0 guardrail: verify the rendered document re-parses before committing.
-/// Returns `Ok(())` if it parses (caller writes), `Err(msg)` otherwise (caller
-/// must abort the write — never leave a corrupt config while reporting success).
-fn verify_toml(rendered: &str) -> Result<(), String> {
-    rendered
-        .parse::<toml_edit::Document>()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
-}
+pub(super) const KIMI_HOOK_COMMAND_MARKER: &str = "statusline render kimi";
 
 /// True if a `[[hooks]]` table entry is one aikey wrote (matched by its
 /// command tail), so re-runs replace rather than duplicate it.
@@ -163,40 +113,23 @@ fn hook_table_is_ours(t: &toml_edit::Table) -> bool {
         .unwrap_or(false)
 }
 
-/// Outcome of a structural merge into a third-party config.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum TomlMergeOutcome {
-    /// The file changed; carries the new full content to write.
-    Changed(String),
-    /// The desired state already holds; nothing to write (idempotent no-op).
-    Unchanged,
-    /// The existing file is invalid TOML that we did not author; the caller
-    /// must back it up + WARN and NOT overwrite it.
-    SkipUnparseable,
-}
-
-/// Pure core: merge aikey's Stop hook into an existing kimi `config.toml`
-/// (given as text), returning the new text. No IO. This is what the unit tests
-/// exercise directly.
+/// Pure core: merge aikey's Stop hook into a parsed kimi `config.toml`.
+/// No IO — `KimiSurface::merge` is the only caller; the guard does the
+/// parse, backup, verify and write around it.
 ///
 /// Invariants:
 ///   - Exactly one aikey-authored Stop hook after merge (dedupe by command).
 ///   - Any non-aikey `hooks` entries the user/kimi wrote are preserved.
 ///   - A foreign top-level `hooks = []` (kimi's own default) is folded into the
-///     array-of-tables instead of colliding with it — the reported bug.
-///   - The result always re-parses as valid TOML.
-pub(super) fn kimi_merge_hook(existing: &str, hook_cmd: &str) -> TomlMergeOutcome {
+///     array-of-tables instead of colliding with it — the 07-04 bug.
+///   - A legacy top-level `default_model = "<our old default>"` is dropped.
+pub(super) fn kimi_merge_hook_doc(
+    mut doc: toml_edit::Document,
+    hook_cmd: &str,
+) -> toml_edit::Document {
     use toml_edit::{value, ArrayOfTables, Item, Table, Value};
 
-    // Legacy cleanup preserved from the string era: drop a top-level
-    // `default_model = "<old-aikey-default>"` that older aikey versions wrote
-    // pointing at a `[models.*]` block we no longer create.
-    let pre = strip_legacy_kimi_default_model(existing);
-
-    let mut doc = match parse_or_heal_toml(&pre) {
-        Some(d) => d,
-        None => return TomlMergeOutcome::SkipUnparseable,
-    };
+    kimi_drop_legacy_default_model(&mut doc);
 
     // Collect existing hook entries (from array-of-tables OR an inline array),
     // dropping any we previously authored.
@@ -224,13 +157,11 @@ pub(super) fn kimi_merge_hook(existing: &str, hook_cmd: &str) -> TomlMergeOutcom
         _ => {}
     }
 
-    // Build our Stop hook table.
     let mut ours = Table::new();
     ours["event"] = value("Stop");
     ours["command"] = value(hook_cmd);
     ours["timeout"] = value(5i64);
 
-    // Rebuild the array-of-tables: kept entries first, then ours.
     let mut aot = ArrayOfTables::new();
     for t in kept {
         aot.push(t);
@@ -244,24 +175,14 @@ pub(super) fn kimi_merge_hook(existing: &str, hook_cmd: &str) -> TomlMergeOutcom
     // + re-inserting gives the AoT an end-of-document position (valid TOML).
     doc.as_table_mut().remove("hooks");
     doc["hooks"] = Item::ArrayOfTables(aot);
-
-    let rendered = doc.to_string();
-    if rendered == existing {
-        TomlMergeOutcome::Unchanged
-    } else {
-        TomlMergeOutcome::Changed(rendered)
-    }
+    doc
 }
 
-/// Pure core: remove aikey's Stop hook(s) from an existing kimi config,
-/// preserving every non-aikey hook. `Unchanged` when we authored nothing here.
-pub(super) fn kimi_remove_hook(existing: &str) -> TomlMergeOutcome {
+/// Pure core: drop aikey's Stop hook(s), preserving every non-aikey hook.
+/// Returns the document unchanged (same bytes) when nothing of ours is there —
+/// the guard's byte compare turns that into `Unchanged`.
+pub(super) fn kimi_remove_hook_doc(mut doc: toml_edit::Document) -> toml_edit::Document {
     use toml_edit::{ArrayOfTables, Item, Table, Value};
-
-    let mut doc = match parse_or_heal_toml(existing) {
-        Some(d) => d,
-        None => return TomlMergeOutcome::SkipUnparseable,
-    };
 
     let mut kept: Vec<Table> = Vec::new();
     let mut removed_ours = false;
@@ -289,11 +210,9 @@ pub(super) fn kimi_remove_hook(existing: &str) -> TomlMergeOutcome {
         }
         _ => {}
     }
-
     if !removed_ours {
-        return TomlMergeOutcome::Unchanged;
+        return doc;
     }
-
     doc.as_table_mut().remove("hooks");
     if !kept.is_empty() {
         let mut aot = ArrayOfTables::new();
@@ -302,43 +221,120 @@ pub(super) fn kimi_remove_hook(existing: &str) -> TomlMergeOutcome {
         }
         doc["hooks"] = Item::ArrayOfTables(aot);
     }
+    doc
+}
 
-    let rendered = doc.to_string();
-    if rendered == existing {
-        TomlMergeOutcome::Unchanged
-    } else {
-        TomlMergeOutcome::Changed(rendered)
+/// The kimi hook currently in the document, if it is ours.
+fn kimi_our_hook_command(doc: &toml_edit::Document) -> Option<String> {
+    use toml_edit::{Item, Value};
+    match doc.get("hooks") {
+        Some(Item::ArrayOfTables(aot)) => {
+            aot.iter().find(|t| hook_table_is_ours(t)).and_then(|t| {
+                t.get("command")
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string)
+            })
+        }
+        Some(Item::Value(Value::Array(arr))) => arr.iter().find_map(|v| match v {
+            Value::InlineTable(it) => {
+                let t = it.clone().into_table();
+                if hook_table_is_ours(&t) {
+                    t.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(str::to_string)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }),
+        _ => None,
     }
 }
 
-/// Strip the aikey-managed region (plus one trailing newline, if any) and
-/// return the remainder. Returns `None` if no region was found.
-fn strip_managed_region(content: &str) -> Option<String> {
-    let begin = content.find(AIKEY_BEGIN)?;
-    let end_rel = content[begin..].find(AIKEY_END)?;
-    let mut end = begin + end_rel + AIKEY_END.len();
-    if content.as_bytes().get(end) == Some(&b'\n') {
-        end += 1;
+/// kimi's `~/.kimi/config.toml` on the guard (Phase 2, 2026-09-05).
+/// spec: R-third-party-config-guard-7 kimi 面经守卫
+pub struct KimiInput {
+    pub hook_cmd: String,
+}
+
+pub struct KimiSurface;
+
+pub const KIMI_OWNED_GRAMMAR: tp::OwnedTomlGrammar = tp::OwnedTomlGrammar {
+    top_level_scalars: &[("default_model", kimi_value_is_legacy_default)],
+    table_headers: &[],
+    hooks_command_marker: Some(KIMI_HOOK_COMMAND_MARKER),
+    region: Some((AIKEY_BEGIN, AIKEY_END)),
+};
+
+impl tp::Surface for KimiSurface {
+    type Doc = toml_edit::Document;
+    type Input = KimiInput;
+
+    const ID: tp::SurfaceId = tp::SurfaceId::Kimi;
+    const FORMAT: tp::Format = tp::Format::Toml;
+    // kimi tolerates an aikey-authored file holding only our hook — and
+    // deletes it again when the hook is the last thing in it (see `apply`).
+    const CREATE: tp::CreatePolicy = tp::CreatePolicy::CreateFileAndDir;
+    // `[[hooks]]` is additive: a user's own hooks and ours coexist.
+    const FOREIGN: tp::ForeignPolicy = tp::ForeignPolicy::NotApplicable;
+    const OWNED_GRAMMAR: Option<&'static tp::OwnedTomlGrammar> = Some(&KIMI_OWNED_GRAMMAR);
+
+    fn path(&self) -> std::path::PathBuf {
+        kimi_config_paths().0
     }
-    let mut out = String::with_capacity(content.len());
-    out.push_str(&content[..begin]);
-    out.push_str(&content[end..]);
-    Some(out)
+    fn load(&self, text: &str) -> Result<Self::Doc, tp::ParseFailure> {
+        tp::parse_toml_strict(text)
+    }
+    fn empty_doc(&self) -> Self::Doc {
+        toml_edit::Document::new()
+    }
+    fn detect(&self, doc: &Self::Doc) -> tp::Detection {
+        // Ownership is the hook's command tail, never a comment marker: kimi
+        // re-serialises its config dropping every comment (2026-07-07), and
+        // the legacy `# BEGIN aikey` region — when it parses at all — is just
+        // comments around a hook table this same scan sees.
+        let cmd = kimi_our_hook_command(doc);
+        let state = if cmd.is_some() {
+            tp::TpConfigState::OursActive
+        } else {
+            tp::TpConfigState::PresentNoAikey
+        };
+        tp::Detection {
+            kimi_hook_command: cmd,
+            ..tp::Detection::of(state)
+        }
+    }
+    fn merge(&self, doc: Self::Doc, input: &Self::Input) -> Result<Self::Doc, String> {
+        Ok(kimi_merge_hook_doc(doc, &input.hook_cmd))
+    }
+    fn remove(&self, doc: Self::Doc) -> Self::Doc {
+        kimi_remove_hook_doc(doc)
+    }
+    fn render(&self, doc: &Self::Doc) -> String {
+        doc.to_string()
+    }
+    fn expected_after_merge(&self, det: &tp::Detection, input: &Self::Input) -> bool {
+        det.state == tp::TpConfigState::OursActive
+            && det.kimi_hook_command.as_deref() == Some(input.hook_cmd.as_str())
+    }
 }
 
-/// Atomic write: tmp file in same dir + rename. Returns the io::Result so
-/// the caller can report failure visibly on first-time install.
-fn write_config_atomic(config_dir: &Path, config_path: &Path, contents: &str) -> io::Result<()> {
-    std::fs::create_dir_all(config_dir)?;
-    let tmp = config_dir.join("config.toml.aikey.tmp");
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, config_path)
+/// The guard's read of `~/.kimi/config.toml`. Single read for status
+/// projections, `aikey env` and `hook repair kimi`.
+pub fn kimi_inspection() -> tp::Inspection {
+    tp::inspect(&KimiSurface)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KimiUninstallOutcome {
     Removed,
     NothingToRemove,
+    /// The file cannot be read (2026-09-05): nothing was touched; the guard
+    /// sentence tells the user how to repair it. Distinct from
+    /// NothingToRemove — "nothing of ours" and "cannot tell" are different
+    /// answers, and the old text scan collapsed them.
+    ConfigInvalid(String),
     // Stage 2.3 windows-compat: dropped `HomeMissing`. Previously surfaced
     // when `env::var("HOME")` failed; now `kimi_config_paths()` always
     // resolves a path (HOME → USERPROFILE → ".") so the status is
@@ -348,27 +344,22 @@ pub(crate) enum KimiUninstallOutcome {
 /// Thin wrapper around `unconfigure_kimi_cli` that reports whether anything
 /// actually changed, for consistent top-level CLI output.
 pub(crate) fn uninstall_kimi_hook() -> KimiUninstallOutcome {
-    // Stage 2.3 windows-compat: use the cross-platform Kimi path resolver
-    // (HOME → USERPROFILE → ...). HomeMissing as a status is preserved
-    // semantically for a degraded environment, but `resolve_user_home`
-    // never returns Err — the `"."` fallback means we always proceed.
-    let (config_path, backup_path) = kimi_config_paths();
-
     // Semantic gate (2026-07-07): marker-text-only detection returned
     // NothingToRemove — skipping removal entirely — once kimi's own config
     // rewrite washed the comment markers out while the hook stayed wired.
-    // kimi_content_has_aikey also matches the hook-command tail, which is
-    // what the structural removal below actually keys on.
-    let had_region = std::fs::read_to_string(&config_path)
-        .map(|c| kimi_content_has_aikey(&c))
-        .unwrap_or(false);
-    let had_backup = backup_path.exists();
-
-    if !had_region && !had_backup {
+    // The guard's detect keys on the hook-command tail, the same identity the
+    // structural removal below strips (detect⇔remove lockstep).
+    let insp = kimi_inspection();
+    if let Some(sentence) = insp.unparseable_sentence() {
+        return KimiUninstallOutcome::ConfigInvalid(sentence);
+    }
+    if !insp.detection.state.has_ours() {
         return KimiUninstallOutcome::NothingToRemove;
     }
-
-    unconfigure_kimi_cli();
+    let out = unconfigure_kimi_cli();
+    if matches!(out.action, tp::TpAction::Refused | tp::TpAction::Failed) {
+        return KimiUninstallOutcome::ConfigInvalid(out.sentence.unwrap_or_default());
+    }
     KimiUninstallOutcome::Removed
 }
 
@@ -424,18 +415,22 @@ pub fn injected_provider_toml_paths() -> Vec<(&'static str, std::path::PathBuf)>
 
 /// Kimi wiring detection — single truth source for ALL kimi readers
 /// (`aikey env` listing, `kimi_status` / statusline status, and the
-/// `uninstall_kimi_hook` gate). The structural hook merge is keyed on the
-/// command's stable tail (KIMI_HOOK_COMMAND_MARKER, see its doc), so that
-/// is the semantic identity; AIKEY_BEGIN / LEGACY_MARKER cover legacy
-/// never-rewritten files. Why one predicate (2026-07-07): the three
+/// `uninstall_kimi_hook` gate). Why one predicate (2026-07-07): the three
 /// readers each had their own marker-text checks, and after kimi/codex
 /// CLIs re-serialize their configs (dropping all comments) the readers
 /// went blind one by one — the uninstall gate even skipped removal while
 /// the hook was still wired.
+///
+/// Since 2026-09-05 it is the guard's structural detect: strict parse, then
+/// "is our hook there". An unparseable file answers `false` — and `remove`
+/// refuses too, so display and removal stay in lockstep
+/// (`kimi_detection_lockstep_with_remove`). Comment markers no longer count.
 pub(super) fn kimi_content_has_aikey(content: &str) -> bool {
-    content.contains(KIMI_HOOK_COMMAND_MARKER)
-        || content.contains(AIKEY_BEGIN)
-        || content.contains(LEGACY_MARKER)
+    use tp::Surface as _;
+    match tp::parse_toml_strict(content) {
+        Ok(doc) => KimiSurface.detect(&doc).state.has_ours(),
+        Err(_) => false,
+    }
 }
 
 fn kimi_config_has_aikey(p: &std::path::Path) -> bool {
@@ -449,7 +444,7 @@ fn codex_config_has_aikey(p: &std::path::Path) -> bool {
     let Ok(content) = std::fs::read_to_string(p) else {
         return false;
     };
-    content.contains(AIKEY_BEGIN) || codex_content_has_aikey(&content)
+    codex_content_has_aikey(&content)
 }
 
 /// Preconditions for the Codex desktop takeover switch, as two independent
@@ -463,34 +458,29 @@ fn codex_config_has_aikey(p: &std::path::Path) -> bool {
 /// status projection reads these same facts so the row is honest up front;
 /// the write-side guard stays as the second line of defence.
 pub fn codex_desktop_preconditions() -> (bool, bool) {
-    let (cfg, _) = codex_config_paths();
-    let Ok(content) = std::fs::read_to_string(&cfg) else {
-        return (false, false);
-    };
-    let Some(doc) = parse_or_heal_toml(&content) else {
-        // Unparseable is treated as "present, block unknown→absent": the write
-        // side refuses to touch an unparseable file too, so the switch stays
-        // blocked with the activate-first reason rather than lying "not
-        // installed" about a file that plainly exists.
-        return (true, false);
-    };
-    let block = doc
-        .get("model_providers")
-        .and_then(|i| i.as_table())
-        .map(|t| t.contains_key("aikey"))
-        .unwrap_or(false);
-    (true, block)
+    // Thin wrapper over the guard's inspection for callers that still want
+    // the two booleans. ⚠️ An UNPARSEABLE file answers (true, false) here —
+    // exactly like a parseable file without our block — so this pair cannot
+    // express "the file is broken". The status projection reads
+    // `codex_inspection()` instead (DEC-third-party-config-guard-1).
+    let det = codex_inspection().detection;
+    let present = det.state != tp::TpConfigState::Missing;
+    let block = det.state == tp::TpConfigState::OursActive;
+    (present, block)
+}
+
+/// The guard's read of `~/.codex/config.toml`: state + lever + backups.
+/// Single read for status projections, `aikey env` and `hook repair`.
+pub fn codex_inspection() -> tp::Inspection {
+    tp::inspect(&CodexSurface)
 }
 
 /// The top-level `model_provider` value when it is neither absent nor ours —
 /// i.e. a value the user (or another tool) set, which the takeover switch
 /// refuses to overwrite. None = absent or "aikey".
 pub fn codex_foreign_top_level_provider() -> Option<String> {
-    let (cfg, _) = codex_config_paths();
-    let content = std::fs::read_to_string(&cfg).ok()?;
-    let doc = parse_or_heal_toml(&content)?;
-    match doc.get("model_provider").and_then(|i| i.as_str()) {
-        Some(v) if v != "aikey" => Some(v.to_string()),
+    match codex_inspection().detection.codex_lever {
+        Some(tp::CodexLever::Foreign { value }) => Some(value),
         _ => None,
     }
 }
@@ -513,14 +503,7 @@ pub fn codex_foreign_top_level_provider() -> Option<String> {
 /// drops every comment, and is why marker-based detection went blind in 2026-07)
 /// is read the same way the writers read it.
 pub fn codex_top_level_provider_is_ours() -> bool {
-    let (cfg, _) = codex_config_paths();
-    let Ok(content) = std::fs::read_to_string(&cfg) else {
-        return false;
-    };
-    let Some(doc) = parse_or_heal_toml(&content) else {
-        return false;
-    };
-    doc.get("model_provider").and_then(|i| i.as_str()) == Some("aikey")
+    codex_inspection().detection.codex_lever == Some(tp::CodexLever::On)
 }
 
 /// True when the config carries anything `codex_remove` would strip. Keep
@@ -528,45 +511,60 @@ pub fn codex_top_level_provider_is_ours() -> bool {
 /// `codex_detection_lockstep_with_remove` pins the equivalence so display
 /// ("wired") and removal ("what unuse strips") can never disagree.
 pub(super) fn codex_content_has_aikey(content: &str) -> bool {
-    let Some(doc) = parse_or_heal_toml(content) else {
-        return false;
-    };
-    let has_table = doc
-        .get("model_providers")
-        .and_then(|i| i.as_table())
-        .map(|t| t.contains_key("aikey"))
-        .unwrap_or(false);
-    let provider_ours = doc.get("model_provider").and_then(|i| i.as_str()) == Some("aikey");
-    let base_ours = doc
-        .get("openai_base_url")
-        .and_then(|i| i.as_str())
-        .map(|v| v.ends_with("/openai"))
-        .unwrap_or(false);
-    has_table || provider_ours || base_ours
+    use tp::Surface as _;
+    match tp::parse_toml_strict(content) {
+        Ok(doc) => CodexSurface.detect(&doc).state.has_ours(),
+        // Unparseable: no verdict — and `codex_remove` refuses too, so the
+        // detect⇔remove lockstep holds (false == not Changed).
+        Err(_) => false,
+    }
 }
 
 /// Inspect the current Kimi config state for `aikey statusline status`. Does
 /// not modify anything. Returns (region_present, hook_command_matches_this_bin).
 pub(crate) fn kimi_status() -> (bool, bool) {
-    let (config_path, _) = kimi_config_paths();
-    let Ok(content) = std::fs::read_to_string(&config_path) else {
-        return (false, false);
-    };
-    kimi_content_status(&content)
+    let det = kimi_inspection().detection;
+    let expected = crate::commands_statusline::aikey_statusline_render_kimi_command();
+    (
+        det.state.has_ours(),
+        det.kimi_hook_command.as_deref() == Some(expected.as_str()),
+    )
 }
 
-/// Pure core of `kimi_status` (2026-07-07, same fix class as the `aikey env`
-/// listing): the first gate used to be the AIKEY_BEGIN comment marker, which
-/// goes blind once kimi re-serializes its config — statusline status then
-/// reported "not wired" on a wired install. Now gated on the shared
-/// semantic predicate.
+/// Pure core of `kimi_status` over text (tests): same structural detect.
 pub(super) fn kimi_content_status(content: &str) -> (bool, bool) {
-    if !kimi_content_has_aikey(content) {
+    use tp::Surface as _;
+    let Ok(doc) = tp::parse_toml_strict(content) else {
         return (false, false);
-    }
+    };
+    let det = KimiSurface.detect(&doc);
     let expected = crate::commands_statusline::aikey_statusline_render_kimi_command();
-    let hook_present = content.contains(&format!("command = \"{expected}\""));
-    (true, hook_present)
+    (
+        det.state.has_ours(),
+        det.kimi_hook_command.as_deref() == Some(expected.as_str()),
+    )
+}
+
+/// Third-party config files aikey injects into that it currently CANNOT read
+/// (strict parse failed). `aikey env` lists them next to the injected ones —
+/// hiding a broken file is how the 2026-09-04 incident stayed invisible.
+/// Each entry carries the guard sentence (file, line:col, repair command).
+pub fn unreadable_provider_configs() -> Vec<(&'static str, std::path::PathBuf, String)> {
+    let mut out = Vec::new();
+    let mut all = vec![
+        kimi_inspection(),
+        codex_inspection(),
+        crate::commands_statusline::claude_inspection(),
+    ];
+    if let Some(d) = crate::commands_account::claude_desktop::desktop_inspection() {
+        all.push(d);
+    }
+    for insp in all {
+        if let Some(sentence) = insp.unparseable_sentence() {
+            out.push((insp.surface.as_str(), insp.path.clone(), sentence));
+        }
+    }
+    out
 }
 
 /// Apply / revert third-party CLI auto-configuration based on the currently
@@ -622,9 +620,14 @@ pub(super) fn providers_need_kimi_scaffold(providers: &[String]) -> bool {
 /// kimi/codex/statusline remain fire-and-forget — only Desktop needs a
 /// consent round-trip, hence only it reports (careful-api: no speculative
 /// fields).
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct ThirdPartyApplyOutcome {
     pub desktop: Option<crate::commands_account::claude_desktop::DesktopSwitch>,
+    /// What the guard did on each file surface this pass (2026-09-05). Lets
+    /// callers with a wire obligation report a refused/failed injection
+    /// without re-detecting; stderr alone was invisible from the tray.
+    /// spec: R-third-party-config-guard-1.S2
+    pub surfaces: Vec<tp::SurfaceOutcome>,
 }
 
 pub fn apply_third_party_cli_configs(
@@ -651,13 +654,12 @@ pub fn apply_third_party_cli_configs_with(
     interactive: bool,
 ) -> ThirdPartyApplyOutcome {
     let has_kimi = providers_need_kimi_scaffold(providers);
-    if has_kimi {
-        // Token-agnostic: writes scaffold once; token comes from KIMI_API_KEY env var.
-        configure_kimi_cli(proxy_port);
+    let kimi_outcome = if has_kimi {
+        configure_kimi_cli(proxy_port)
     } else {
-        // Switching away from kimi — restore Kimi CLI to standalone mode.
-        unconfigure_kimi_cli();
-    }
+        // Switching away from kimi — drop our Stop hook, keep everything else.
+        Some(unconfigure_kimi_cli())
+    };
 
     // Codex CLI: install full aikey scaffold when openai provider is active.
     // Writes (1) `[model_providers.aikey]` block (custom provider with
@@ -674,30 +676,26 @@ pub fn apply_third_party_cli_configs_with(
         let c = p.to_lowercase();
         c == "openai" || c == "gpt" || c == "chatgpt"
     });
-    if has_openai {
-        configure_codex_cli(proxy_port);
+    let codex_outcome = if has_openai {
+        configure_codex_cli(proxy_port)
     } else {
-        unconfigure_codex_cli();
-    }
+        Some(tp::apply(&CodexSurface, tp::TpOp::Remove))
+    };
 
-    // Claude Code statusLine: install when anthropic is active, uninstall
-    // when it's not. Symmetric handling — without this, switching away from
-    // anthropic (via `aikey use <non-anthropic>` or `aikey unuse anthropic`)
-    // would leave a stale `aikey statusline` entry in `~/.claude/settings.json`,
-    // visible to users as a residual injection in `aikey env`. Single funnel
-    // here means every binding-changing path reconciles claude's settings.json
-    // alongside the kimi/codex tomls.
-    //
-    // Both helpers are idempotent and conflict-aware: install skips silently
-    // if a third-party statusLine (starship, ccusage, etc.) already owns the
-    // slot; uninstall is gated on `points_to_us` so it only touches aikey-
-    // owned entries. quiet=true suppresses uninstall chatter so this lifecycle
-    // tail doesn't spam the terminal on every binding operation.
-    let has_anthropic = providers.iter().any(|p| {
-        let c = p.to_lowercase();
-        c == "anthropic" || c == "claude"
-    });
+    // Claude Code: install statusline when anthropic provider is active
+    // (the statusline installer is idempotent; the Desktop takeover rides
+    // alongside the kimi/codex tomls).
+    let has_anthropic = providers
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case("anthropic") || p.eq_ignore_ascii_case("claude"));
+
     let mut out = ThirdPartyApplyOutcome::default();
+    if let Some(o) = kimi_outcome {
+        out.surfaces.push(o);
+    }
+    if let Some(o) = codex_outcome {
+        out.surfaces.push(o);
+    }
     if has_anthropic {
         crate::commands_statusline::ensure_claude_statusline_installed();
         // Claude Desktop takeover (阶段7 D1): lives INSIDE this function body
@@ -722,45 +720,39 @@ pub fn apply_third_party_cli_configs_with(
 
 /// Ensure aikey's Stop hook exists in `~/.kimi/config.toml`.
 ///
-/// Structurally merges the hook via `kimi_merge_hook` (toml_edit) — subsequent
-/// `aikey use` calls are no-ops when unchanged, because the hook is
-/// token-agnostic (token overrides ride the `KIMI_API_KEY` env var at runtime).
+/// Structurally merges the hook through the guard (`KimiSurface`): strict
+/// parse, backup before the first byte changes, verify, one atomic write.
+/// Subsequent `aikey use` calls are byte-identical no-ops, because the hook
+/// is token-agnostic (token overrides ride the `KIMI_API_KEY` env var).
 /// The merge is immune to kimi's own `hooks = []` because it edits the parsed
-/// document, never raw text (see the foreign-config TOML merge core above).
-pub fn configure_kimi_cli(_proxy_port: u16) {
+/// document, never raw text (07-04). An unparseable file is REFUSED with the
+/// guard sentence (never healed by guessing — 2026-09-05, Phase 2).
+/// Returns None only when the user declined the first-time prompt.
+pub fn configure_kimi_cli(_proxy_port: u16) -> Option<tp::SurfaceOutcome> {
     use colored::Colorize;
     use std::io::{IsTerminal, Write};
 
-    let (config_path, backup_path) = kimi_config_paths();
-    let config_dir = config_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| resolve_user_home().join(".kimi"));
-
-    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
     let hook_cmd = crate::commands_statusline::aikey_statusline_render_kimi_command();
-
-    // First-time = our hook not yet present (semantic identity, not a text
-    // marker). Governs the TTY prompt + one-time backup.
-    let first_time = !existing.contains(KIMI_HOOK_COMMAND_MARKER);
+    let insp = kimi_inspection();
+    // First-time = our hook not yet present (semantic identity). Governs the
+    // TTY prompt. A broken file is "first time" too — the guard will refuse
+    // and print why, which is more useful than a silent skip.
+    let first_time = !insp.detection.state.has_ours();
 
     if first_time && io::stderr().is_terminal() {
         // Hook-only footprint: providers/models come from env vars set in
         // active.env; only the `[[hooks]]` Stop entry needs file-backed storage.
-        let rows: Vec<String> = {
-            let mut r = vec![
-                format!("File:    {}", display_path(".kimi/config.toml")),
-                "Add:     Stop hook → aikey statusline render kimi".to_string(),
-                "         (provider/models come from env vars)".to_string(),
-            ];
-            if !existing.is_empty() {
-                r.push(format!(
-                    "Backup:  {}",
-                    display_path(".kimi/config.aikey_backup.toml")
-                ));
-            }
-            r
-        };
+        let mut rows = vec![
+            format!("File:    {}", display_path(".kimi/config.toml")),
+            "Add:     Stop hook → aikey statusline render kimi".to_string(),
+            "         (provider/models come from env vars)".to_string(),
+        ];
+        if insp.detection.state != tp::TpConfigState::Missing {
+            rows.push(format!(
+                "Backup:  {} (versioned, kept)",
+                display_path(".kimi/config.toml.aikey_backup_<time>")
+            ));
+        }
         crate::ui_frame::eprint_box(crate::symbols::QUESTION.s(), "Configure Kimi CLI", &rows);
         eprint!("  Proceed? [Y/n] (default Y): ");
         io::stderr().flush().ok();
@@ -770,119 +762,36 @@ pub fn configure_kimi_cli(_proxy_port: u16) {
                 "  {}",
                 "Skipped. Run 'aikey use kimi' again to retry.".dimmed()
             );
-            return;
+            return None;
         }
     }
 
-    match kimi_merge_hook(&existing, &hook_cmd) {
-        TomlMergeOutcome::Unchanged => {}
-        TomlMergeOutcome::SkipUnparseable => {
-            // Honest failure (失败要显眼): the file is invalid TOML we did NOT
-            // author, so we refuse to overwrite it and surface a WARN instead of
-            // silently reporting success. Back it up so the user can recover.
-            if !existing.is_empty() && !backup_path.exists() {
-                let _ = std::fs::create_dir_all(&config_dir);
-                let _ = std::fs::copy(&config_path, &backup_path);
-            }
-            eprintln!(
-                "  {} ~/.kimi/config.toml is not valid TOML (not written by aikey); \
-                 left untouched. Backup: {}. Fix it, then run 'aikey use kimi'.",
-                "!".yellow(),
-                backup_path.display().to_string().dimmed()
-            );
-        }
-        TomlMergeOutcome::Changed(desired) => {
-            // Layer-0 guardrail: re-parse before committing. A structural merge
-            // should always produce valid TOML, but verifying means a future
-            // regression can never leave a corrupt config behind a green ✓.
-            if let Err(e) = verify_toml(&desired) {
-                eprintln!(
-                    "  {} Refusing to write invalid Kimi config ({e}); left untouched.",
-                    "!".yellow()
-                );
-                return;
-            }
-            if first_time && !existing.is_empty() && !backup_path.exists() {
-                let _ = std::fs::create_dir_all(&config_dir);
-                let _ = std::fs::copy(&config_path, &backup_path);
-            }
-            match write_config_atomic(&config_dir, &config_path, &desired) {
-                Ok(_) => {
-                    if first_time && io::stderr().is_terminal() {
-                        eprintln!(
-                            "  {} Kimi CLI auto-configured: {}",
-                            crate::symbols::CHECK.s().green().bold(),
-                            config_path.display().to_string().dimmed()
-                        );
-                    }
-                }
-                Err(e) => {
-                    if first_time && io::stderr().is_terminal() {
-                        eprintln!("  {} Could not configure Kimi CLI: {}", "!".yellow(), e);
-                    }
-                }
-            }
-        }
+    let out = tp::apply(&KimiSurface, tp::TpOp::Merge(KimiInput { hook_cmd }));
+    if matches!(out.action, tp::TpAction::Created | tp::TpAction::Merged)
+        && first_time
+        && io::stderr().is_terminal()
+    {
+        eprintln!(
+            "  {} Kimi CLI auto-configured: {}",
+            crate::symbols::CHECK.s().green().bold(),
+            out.path.display().to_string().dimmed()
+        );
     }
+    // Refused / Failed already printed their sentence and logged the event.
+    Some(out)
 }
 
-/// Revert `~/.kimi/config.toml` to its pre-aikey state.
+/// Remove aikey's Stop hook from `~/.kimi/config.toml` — and nothing else.
 ///
-/// Priority: (1) restore `config.aikey_backup.toml` wholesale; (2) failing
-/// that, strip the `# BEGIN aikey …` region; (3) legacy fallback — if the
-/// file only contains old-style marker lines AND nothing else useful, drop
-/// the file entirely.
-///
-/// **Asymmetry with Claude uninstall**: because provider + hook share a
-/// managed region, uninstall resets the Kimi provider to whatever was in the
-/// backup (or nothing). This is documented behavior — users who want to keep
-/// the provider but drop only the hook must hand-edit the hooks block out of
-/// the marker region.
-pub fn unconfigure_kimi_cli() {
-    let (config_path, backup_path) = kimi_config_paths();
-    let config_dir = config_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| resolve_user_home().join(".kimi"));
-
-    // Path 1: backup exists — rename overwrites atomically.
-    if backup_path.exists() {
-        let _ = std::fs::rename(&backup_path, &config_path);
-        return;
-    }
-
-    let Ok(content) = std::fs::read_to_string(&config_path) else {
-        return;
-    };
-
-    // Path 2: structural removal — drop only our Stop hook, keep every other
-    // key and any non-aikey hooks the user/kimi added.
-    match kimi_remove_hook(&content) {
-        TomlMergeOutcome::Changed(out) => {
-            if out.trim().is_empty() {
-                let _ = std::fs::remove_file(&config_path);
-            } else {
-                let _ = write_config_atomic(&config_dir, &config_path, &out);
-            }
-        }
-        TomlMergeOutcome::Unchanged => {}
-        TomlMergeOutcome::SkipUnparseable => {
-            // Foreign-invalid file: fall back to the historical text strip so a
-            // pre-toml_edit broken install can still be cleaned up.
-            if let Some(stripped) = strip_managed_region(&content) {
-                let cleaned = stripped.trim_end().to_string();
-                if cleaned.is_empty() {
-                    let _ = std::fs::remove_file(&config_path);
-                } else {
-                    let mut with_nl = cleaned;
-                    with_nl.push('\n');
-                    let _ = write_config_atomic(&config_dir, &config_path, &with_nl);
-                }
-            } else if content.contains(LEGACY_MARKER) {
-                let _ = std::fs::remove_file(&config_path);
-            }
-        }
-    }
+/// 🔴 Reversed 2026-09-05 (user decision, third-party-config-guard): this
+/// used to restore `config.aikey_backup.toml` wholesale, which overwrote
+/// every edit the user (or kimi itself) made after aikey's first touch. Now
+/// the structural remove drops only our hook table; a file that then holds
+/// nothing is deleted (we created it); an unparseable file is refused with
+/// the repair sentence. Backups are never consumed — `hook repair kimi
+/// --from-backup` is the explicit way to use one.
+pub fn unconfigure_kimi_cli() -> tp::SurfaceOutcome {
+    tp::apply(&KimiSurface, tp::TpOp::Remove)
 }
 
 // ============================================================================
@@ -952,8 +861,6 @@ pub fn unconfigure_kimi_cli() {
 // conflict is detected, we skip the line and print a stderr hint so the user
 // can resolve it manually without silently breaking their setup.
 
-const CODEX_LINE_MARKER: &str = "# managed by aikey";
-
 /// Codex config.toml base_url (§5.5 per-provider). If the openai-family active
 /// binding (openai/gpt/chatgpt) is a direct-bind managed VK on a cluster, point
 /// codex at the central node; else (including Team OAuth pools) use the local
@@ -986,18 +893,19 @@ fn codex_base_url(proxy_port: u16) -> String {
 /// bug: the old code blind-appended this table, so a user who independently
 /// defined `[model_providers.aikey]` (no marker) got a duplicate-table → invalid
 /// TOML. A structural set replaces in place instead.
-pub(super) fn codex_merge(existing: &str, base_url: &str) -> (TomlMergeOutcome, bool) {
+
+/// Document core of `codex_merge`. Returns `(doc, model_provider_written)`.
+/// `model_provider_written` is false when the top-level slot holds a foreign
+/// value (restore-fidelity: never overwrite it; the wrapper injects `-c`).
+pub(super) fn codex_merge_doc(
+    mut doc: toml_edit::Document,
+    base_url: &str,
+) -> (toml_edit::Document, bool) {
     use toml_edit::{value, Item, Table};
 
-    let mut doc = match parse_or_heal_toml(existing) {
-        Some(d) => d,
-        None => return (TomlMergeOutcome::SkipUnparseable, false),
-    };
-
-    // Detect a user-set non-default `model_provider` from the ORIGINAL text
-    // before we mutate anything (preserves the pre-existing conflict semantics).
-    let conflict = detect_codex_model_provider_conflict(existing);
-    let model_provider_written = conflict.is_none();
+    // Read the lever from the PARSED document (was: a text scan of the
+    // original that also honoured a `# managed by aikey` line marker).
+    let model_provider_written = !matches!(codex_lever_of(&doc), tp::CodexLever::Foreign { .. });
 
     // Top-level scalars. No positioning needed: toml_edit's Document renderer
     // structurally emits ALL root-level values before ANY `[table]` section
@@ -1039,49 +947,32 @@ pub(super) fn codex_merge(existing: &str, base_url: &str) -> (TomlMergeOutcome, 
         parent.insert("aikey", Item::Table(aikey_tbl));
     }
 
-    let rendered = doc.to_string();
-    let outcome = if rendered == existing {
-        TomlMergeOutcome::Unchanged
-    } else {
-        TomlMergeOutcome::Changed(rendered)
-    };
-    (outcome, model_provider_written)
+    (doc, model_provider_written)
+}
+
+/// The codex desktop/IDE lever as read from a parsed document.
+/// Absent or `"openai"` (Codex's own default) = `Off`; `"aikey"` = `On`;
+/// anything else is a value the user or another tool set = `Foreign`
+/// (never overwritten — restore-fidelity, 2026-08-18).
+pub(super) fn codex_lever_of(doc: &toml_edit::Document) -> tp::CodexLever {
+    match doc.get("model_provider").and_then(|i| i.as_str()) {
+        Some("aikey") => tp::CodexLever::On,
+        None | Some("openai") => tp::CodexLever::Off,
+        Some(v) => tp::CodexLever::Foreign {
+            value: v.to_string(),
+        },
+    }
 }
 
 /// Detect whether the user has set a non-default `model_provider` that we
 /// should NOT overwrite. Returns `Some(value)` if there's a real conflict.
-///
-/// Safe-to-overwrite cases (returns None):
-/// - No `model_provider` line at all
-/// - `model_provider = "openai"` (Codex default — overwriting is a no-op intent change)
-/// - `model_provider = "aikey"` (our own past write)
-/// - Any `model_provider` line with our `# managed by aikey` marker
-fn detect_codex_model_provider_conflict(content: &str) -> Option<String> {
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with("model_provider") {
-            continue;
-        }
-        let after_key = trimmed["model_provider".len()..].trim_start();
-        let after_eq = match after_key.strip_prefix('=') {
-            Some(s) => s.trim_start(),
-            None => continue,
-        };
-        let rest = match after_eq.strip_prefix('"') {
-            Some(s) => s,
-            None => continue,
-        };
-        let end = match rest.find('"') {
-            Some(i) => i,
-            None => continue,
-        };
-        let value = &rest[..end];
-        if line.contains(CODEX_LINE_MARKER) || value == "openai" || value == "aikey" {
-            return None;
-        }
-        return Some(value.to_string());
+/// Now a thin reader over the parsed lever (unparseable text = no verdict).
+pub(super) fn detect_codex_model_provider_conflict(content: &str) -> Option<String> {
+    let doc = tp::parse_toml_strict(content).ok()?;
+    match codex_lever_of(&doc) {
+        tp::CodexLever::Foreign { value } => Some(value),
+        _ => None,
     }
-    None
 }
 
 /// Auto-configure `~/.codex/config.toml` so Codex routes OpenAI requests
@@ -1120,15 +1011,11 @@ fn codex_consent_blocks(first_time: bool, stored: Option<&str>) -> bool {
     first_time && stored == Some("never")
 }
 
-pub fn configure_codex_cli(proxy_port: u16) {
+pub fn configure_codex_cli(proxy_port: u16) -> Option<tp::SurfaceOutcome> {
     use colored::Colorize;
     use std::io::{IsTerminal, Write};
 
-    let (config_path, backup_path) = codex_config_paths();
-    let config_dir = config_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| resolve_user_home().join(".codex"));
+    let (config_path, _legacy_backup) = codex_config_paths();
 
     // Cluster form-① (P5, §5.5 per-provider): node if the openai binding is a
     // direct-bind managed VK on a cluster, else local proxy. See codex_base_url.
@@ -1136,10 +1023,8 @@ pub fn configure_codex_cli(proxy_port: u16) {
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
 
     // First-time = our provider block not yet present (structural identity, plus
-    // legacy markers for pre-toml_edit installs). Governs the prompt + backup.
-    let first_time = !existing.contains("model_providers.aikey")
-        && !existing.contains(AIKEY_BEGIN)
-        && !existing.contains(CODEX_LINE_MARKER);
+    // the legacy region marker for pre-toml_edit installs). Governs the prompt.
+    let first_time = !existing.contains("model_providers.aikey") && !existing.contains(AIKEY_BEGIN);
 
     // 方案一 (2026-07-16, user decision): one consent for the one physical
     // switch — this config.toml is read by Codex CLI, the IDE extension AND
@@ -1152,7 +1037,7 @@ pub fn configure_codex_cli(proxy_port: u16) {
     // state); see research/codex-desktop-takeover/2026-07-16-codex-desktop.md.
     let stored_consent = crate::global_config::get_codex_consent().unwrap_or(None);
     if codex_consent_blocks(first_time, stored_consent.as_deref()) {
-        return;
+        return None;
     }
     if first_time && io::stderr().is_terminal() {
         let mut rows: Vec<String> = vec![
@@ -1180,7 +1065,7 @@ pub fn configure_codex_cli(proxy_port: u16) {
             CodexConsentAnswer::Yes => {}
             CodexConsentAnswer::No => {
                 eprintln!("  {}", "Skipped. Run 'aikey use' again to retry.".dimmed());
-                return;
+                return None;
             }
             CodexConsentAnswer::Never => {
                 let _ = crate::global_config::set_codex_consent_never();
@@ -1189,15 +1074,15 @@ pub fn configure_codex_cli(proxy_port: u16) {
                     "Skipped permanently — aikey won't ask again. Undo: aikey hook install codex"
                         .dimmed()
                 );
-                return;
+                return None;
             }
         }
     }
 
-    let (outcome, model_provider_written) = codex_merge(&existing, &base_url);
-
-    // Preserve the pre-existing conflict messaging: printed unconditionally
-    // (stderr, non-TTY-gated) when the user has a non-default `model_provider`.
+    // Conflict hint (unconditional, non-TTY-gated — kept verbatim): a foreign
+    // top-level `model_provider` means the block is installed but not
+    // activated for file-only clients; the shell wrapper still injects `-c`.
+    let model_provider_written = detect_codex_model_provider_conflict(&existing).is_none();
     if !model_provider_written {
         if let Some(other) = detect_codex_model_provider_conflict(&existing) {
             eprintln!(
@@ -1230,42 +1115,18 @@ pub fn configure_codex_cli(proxy_port: u16) {
         }
     }
 
-    let desired = match outcome {
-        TomlMergeOutcome::Unchanged => return,
-        TomlMergeOutcome::SkipUnparseable => {
-            // Honest failure: never overwrite a foreign-invalid config.
-            if !existing.is_empty() && !backup_path.exists() {
-                let _ = std::fs::create_dir_all(&config_dir);
-                let _ = std::fs::copy(&config_path, &backup_path);
-            }
-            eprintln!(
-                "  {} ~/.codex/config.toml is not valid TOML (not written by aikey); \
-                 left untouched. Backup: {}. Fix it, then run 'aikey use'.",
-                "!".yellow(),
-                backup_path.display().to_string().dimmed()
-            );
-            return;
-        }
-        TomlMergeOutcome::Changed(d) => d,
-    };
-
-    // Layer-0 guardrail: verify before commit.
-    if let Err(e) = verify_toml(&desired) {
-        eprintln!(
-            "  {} Refusing to write invalid Codex config ({e}); left untouched.",
-            "!".yellow()
-        );
-        return;
-    }
-
-    // Backup once, only on first touch.
-    if first_time && !existing.is_empty() && !backup_path.exists() {
-        let _ = std::fs::create_dir_all(&config_dir);
-        let _ = std::fs::copy(&config_path, &backup_path);
-    }
-
-    match write_config_atomic(&config_dir, &config_path, &desired) {
-        Ok(_) => {
+    // Through the guard: strict parse (unparseable → refused with the shared
+    // sentence, file untouched, event logged), versioned backup before the
+    // first byte changes, verify, one atomic write.
+    // spec: R-third-party-config-guard-1.S2 坏文件不阻塞 KEY 激活
+    let out = tp::apply(
+        &CodexSurface,
+        tp::TpOp::Merge(CodexInput::Scaffold {
+            base_url: base_url.clone(),
+        }),
+    );
+    match out.action {
+        tp::TpAction::Merged | tp::TpAction::Created => {
             if first_time && io::stderr().is_terminal() {
                 eprintln!(
                     "  {} Codex CLI auto-configured: {}",
@@ -1281,24 +1142,14 @@ pub fn configure_codex_cli(proxy_port: u16) {
                 }
             }
         }
-        Err(e) => {
-            if first_time && io::stderr().is_terminal() {
-                eprintln!("  {} Could not configure Codex CLI: {}", "!".yellow(), e);
-            }
-        }
+        // Refused/Failed already printed their sentence and logged the event.
+        _ => {}
     }
+    Some(out)
 }
 
-/// Pure core: remove aikey's Codex routing from an existing config, preserving
-/// all user content. Removes `[model_providers.aikey]`, resets `model_provider`
-/// if it is our value, and drops `openai_base_url` when it points at our proxy
-/// (value ending in `/openai` — the shape `codex_base_url` writes).
-pub(super) fn codex_remove(existing: &str) -> TomlMergeOutcome {
-    let mut doc = match parse_or_heal_toml(existing) {
-        Some(d) => d,
-        None => return TomlMergeOutcome::SkipUnparseable,
-    };
-
+/// Document core of `codex_remove`: strips ONLY our keys.
+pub(super) fn codex_remove_doc(mut doc: toml_edit::Document) -> toml_edit::Document {
     // Drop [model_providers.aikey]; if the parent becomes empty, drop it too.
     if let Some(parent) = doc
         .get_mut("model_providers")
@@ -1324,12 +1175,351 @@ pub(super) fn codex_remove(existing: &str) -> TomlMergeOutcome {
     if ours {
         doc.as_table_mut().remove("openai_base_url");
     }
+    doc
+}
 
-    let rendered = doc.to_string();
-    if rendered == existing {
-        TomlMergeOutcome::Unchanged
+// ── Codex surface adapter (third-party config guard) ─────────────────────────
+//
+// spec: R-third-party-config-guard-2 一切写盘经唯一守卫（codex 面）
+// design: DEC-third-party-config-guard-3 顶层杠杆是 facet 不是子状态
+
+/// What a codex Merge wants: the full scaffold (block + base_url + lever when
+/// not foreign) or just the desktop/IDE lever line.
+#[derive(Debug, Clone)]
+pub enum CodexInput {
+    Scaffold { base_url: String },
+    Lever(bool),
+}
+
+pub struct CodexSurface;
+
+/// Owned-key grammar for `hook repair codex --strip-ours` — the ONLY text-level
+/// mutation, and only on files that do not parse.
+/// `aikey hook repair <tool> [--strip-ours | --from-backup [PATH]] [--yes] [--json]`.
+///
+/// CLI shell only: argument decoding, the interactive confirmation, and the
+/// two output shapes. Every decision and every byte written happens in
+/// `third_party_config::repair` — the same door `use` / `unuse` go through.
+/// Returns the process exit code (0 done or diagnosed, 2 refused, 1 IO).
+/// spec: R-third-party-config-guard-3 修复只删 aikey 自有内容
+pub fn hook_repair(
+    target: &str,
+    strip_ours: bool,
+    from_backup: Option<Option<std::path::PathBuf>>,
+    yes: bool,
+    json: bool,
+) -> Result<i32, String> {
+    use colored::Colorize;
+    let Some(surface) = tp::SurfaceId::parse(target) else {
+        return Err(format!(
+            "unknown repair target '{target}'. One of: codex, kimi, claude, claude-desktop."
+        ));
+    };
+    if strip_ours && from_backup.is_some() {
+        return Err("--strip-ours and --from-backup are exclusive; pick one.".into());
+    }
+    let mode = if strip_ours {
+        tp::RepairMode::StripOurs
+    } else if let Some(p) = from_backup {
+        tp::RepairMode::FromBackup(p)
     } else {
-        TomlMergeOutcome::Changed(rendered)
+        tp::RepairMode::Diagnose
+    };
+    match surface {
+        tp::SurfaceId::Codex => run_repair(&CodexSurface, mode, yes, json),
+        tp::SurfaceId::Kimi => run_repair(&KimiSurface, mode, yes, json),
+        tp::SurfaceId::Claude => {
+            run_repair(&crate::commands_statusline::ClaudeSurface, mode, yes, json)
+        }
+        tp::SurfaceId::ClaudeDesktop => {
+            let Some(paths) = crate::commands_account::claude_desktop::desktop_paths() else {
+                eprintln!(
+                    "  {} Claude Desktop has no build for this platform — nothing to repair.",
+                    "!".yellow()
+                );
+                return Ok(2);
+            };
+            run_repair(
+                &crate::commands_account::claude_desktop::DesktopSurface::at(&paths),
+                mode,
+                yes,
+                json,
+            )
+        }
+    }
+}
+
+/// One repair flow for every surface on the guard: dry pass → head →
+/// preview + consent → real pass → outcome. `--yes` or a "y" on a real
+/// terminal is the consent; a GUI passes `--yes` because its click is.
+fn run_repair<S: tp::Surface>(
+    s: &S,
+    mode: tp::RepairMode,
+    yes: bool,
+    json: bool,
+) -> Result<i32, String> {
+    use colored::Colorize;
+    let mut report = tp::repair(s, mode.clone(), yes);
+    if json {
+        crate::json_output::print_json(serde_json::json!({
+            "ok": report.exit_code() == 0,
+            "report": report,
+        }));
+        return Ok(report.exit_code());
+    }
+    print_repair_head(&report);
+    let needs_consent = report
+        .outcome
+        .as_ref()
+        .is_some_and(|o| o.reason_code == Some(tp::ReasonCode::TpNeedsConfirmation));
+    if needs_consent {
+        use std::io::{IsTerminal, Write};
+        print_repair_preview(&report);
+        if std::io::stdin().is_terminal() {
+            eprint!("  Proceed? [y/N] ");
+            let _ = std::io::stderr().flush();
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            if line.trim().eq_ignore_ascii_case("y") {
+                report = tp::repair(s, mode, true);
+            } else {
+                eprintln!("  {}", "Skipped. Nothing was changed.".dimmed());
+                return Ok(2);
+            }
+        } else if let Some(sentence) = report.outcome.as_ref().and_then(|o| o.sentence.as_deref()) {
+            // No terminal to ask on: say exactly what --yes would do.
+            eprintln!("  {} {sentence}", "!".yellow());
+            return Ok(report.exit_code());
+        }
+    }
+    print_repair_outcome(&report);
+    Ok(report.exit_code())
+}
+
+fn print_repair_head(report: &tp::RepairReport) {
+    use colored::Colorize;
+    let lever = match &report.codex_lever {
+        Some(tp::CodexLever::On) => " (desktop/IDE lever: aikey)".to_string(),
+        Some(tp::CodexLever::Off) => " (desktop/IDE lever: off)".to_string(),
+        Some(tp::CodexLever::Foreign { value }) => {
+            format!(" (desktop/IDE lever: '{value}', not ours)")
+        }
+        None => String::new(),
+    };
+    match &report.sentence {
+        Some(sentence) => eprintln!("  {} {sentence}", "!".yellow()),
+        None => eprintln!(
+            "  {} {}: {}{lever}",
+            crate::symbols::CHECK.s(),
+            tp::display_for(&report.path),
+            report.state.label()
+        ),
+    }
+    if report.backups.is_empty() {
+        eprintln!("  {}", "no aikey backups".dimmed());
+    } else {
+        eprintln!("  aikey backups (newest first):");
+        for b in &report.backups {
+            eprintln!("    {}", tp::display_for(b));
+        }
+    }
+}
+
+fn print_repair_preview(report: &tp::RepairReport) {
+    use colored::Colorize;
+    if report.preview.is_empty() {
+        eprintln!(
+            "  {}",
+            "would restore the file from backup (current content is backed up first)".dimmed()
+        );
+        return;
+    }
+    eprintln!(
+        "  Lines aikey would remove from {}:",
+        tp::display_for(&report.path)
+    );
+    for (n, l) in &report.preview {
+        eprintln!("    {:>4} | {}", n, l.dimmed());
+    }
+}
+
+fn print_repair_outcome(report: &tp::RepairReport) {
+    use colored::Colorize;
+    let Some(o) = &report.outcome else { return };
+    match o.action {
+        tp::TpAction::Stripped => eprintln!(
+            "  {} removed {} aikey line(s); the file parses again. Backup: {}",
+            crate::symbols::CHECK.s(),
+            report.preview.len(),
+            o.backup_path
+                .as_deref()
+                .map(tp::display_for)
+                .unwrap_or_default()
+        ),
+        tp::TpAction::Restored => eprintln!(
+            "  {} restored from backup. Previous content kept as {}",
+            crate::symbols::CHECK.s(),
+            o.backup_path
+                .as_deref()
+                .map(tp::display_for)
+                .unwrap_or_else(|| "(file was absent)".into())
+        ),
+        tp::TpAction::Removed => eprintln!(
+            "  {} removed aikey's keys. Backup: {}",
+            crate::symbols::CHECK.s(),
+            o.backup_path
+                .as_deref()
+                .map(tp::display_for)
+                .unwrap_or_default()
+        ),
+        tp::TpAction::Unchanged => {
+            eprintln!(
+                "  {}",
+                "nothing of aikey's to remove; file left as is".dimmed()
+            )
+        }
+        // Refused / Failed already printed their sentence via the guard.
+        _ => {}
+    }
+}
+
+pub const CODEX_OWNED_GRAMMAR: tp::OwnedTomlGrammar = tp::OwnedTomlGrammar {
+    top_level_scalars: &[
+        ("model_provider", codex_value_is_ours_provider),
+        ("openai_base_url", codex_value_is_our_base_url),
+    ],
+    table_headers: &["model_providers.aikey"],
+    hooks_command_marker: None,
+    region: Some((AIKEY_BEGIN, AIKEY_END)),
+};
+
+fn codex_value_is_ours_provider(v: &str) -> bool {
+    v == "aikey"
+}
+
+fn codex_value_is_our_base_url(v: &str) -> bool {
+    v.ends_with("/openai")
+}
+
+impl tp::Surface for CodexSurface {
+    type Doc = toml_edit::Document;
+    type Input = CodexInput;
+
+    const ID: tp::SurfaceId = tp::SurfaceId::Codex;
+    const FORMAT: tp::Format = tp::Format::Toml;
+    const CREATE: tp::CreatePolicy = tp::CreatePolicy::CreateFileAndDir;
+    // The provider block is additive (keyed by our own name); only the
+    // top-level lever is exclusive, and that is handled as a facet.
+    const FOREIGN: tp::ForeignPolicy = tp::ForeignPolicy::NotApplicable;
+    const OWNED_GRAMMAR: Option<&'static tp::OwnedTomlGrammar> = Some(&CODEX_OWNED_GRAMMAR);
+
+    fn path(&self) -> std::path::PathBuf {
+        codex_config_paths().0
+    }
+
+    fn load(&self, text: &str) -> Result<Self::Doc, tp::ParseFailure> {
+        tp::parse_toml_strict(text)
+    }
+
+    fn empty_doc(&self) -> Self::Doc {
+        toml_edit::Document::new()
+    }
+
+    fn detect(&self, doc: &Self::Doc) -> tp::Detection {
+        let has_table = doc
+            .get("model_providers")
+            .and_then(|i| i.as_table())
+            .map(|t| t.contains_key("aikey"))
+            .unwrap_or(false);
+        let lever = codex_lever_of(doc);
+        let base_ours = doc
+            .get("openai_base_url")
+            .and_then(|i| i.as_str())
+            .map(|v| v.ends_with("/openai"))
+            .unwrap_or(false);
+        let legacy_marker = doc.to_string().contains(AIKEY_BEGIN);
+        let state = if has_table {
+            tp::TpConfigState::OursActive
+        } else if lever == tp::CodexLever::On || base_ours || legacy_marker {
+            // Lever/base_url without the block: the "Model provider aikey not
+            // found" shape (2026-05-18). Still ours → unuse must strip it.
+            tp::TpConfigState::OurResidue
+        } else {
+            tp::TpConfigState::PresentNoAikey
+        };
+        let local_baseurl_port = doc
+            .get("openai_base_url")
+            .and_then(|i| i.as_str())
+            .and_then(|v| {
+                crate::profile_activation::local_url_port(&format!("openai_base_url = \"{v}\""))
+            });
+        tp::Detection {
+            state,
+            codex_lever: Some(lever),
+            local_baseurl_port,
+            kimi_hook_command: None,
+        }
+    }
+
+    fn merge(&self, doc: Self::Doc, input: &Self::Input) -> Result<Self::Doc, String> {
+        match input {
+            CodexInput::Scaffold { base_url } => Ok(codex_merge_doc(doc, base_url).0),
+            CodexInput::Lever(true) => {
+                let mut doc = doc;
+                doc["model_provider"] = toml_edit::value("aikey");
+                Ok(doc)
+            }
+            CodexInput::Lever(false) => {
+                let mut doc = doc;
+                if doc.get("model_provider").and_then(|i| i.as_str()) == Some("aikey") {
+                    doc.as_table_mut().remove("model_provider");
+                }
+                Ok(doc)
+            }
+        }
+    }
+
+    fn remove(&self, doc: Self::Doc) -> Self::Doc {
+        codex_remove_doc(doc)
+    }
+
+    fn render(&self, doc: &Self::Doc) -> String {
+        doc.to_string()
+    }
+
+    fn refuse_merge(
+        &self,
+        det: &tp::Detection,
+        input: &Self::Input,
+    ) -> Option<(tp::ReasonCode, tp::ReasonCtx)> {
+        let CodexInput::Lever(true) = input else {
+            return None;
+        };
+        let ctx = |owner: Option<String>| tp::ReasonCtx {
+            surface: Some(tp::SurfaceId::Codex),
+            path_display: tp::display_for(&self.path()),
+            format: Some(tp::Format::Toml),
+            owner,
+            ..Default::default()
+        };
+        // 🚫 Never point the lever at a block that does not exist (2026-05-18
+        // shape: "Model provider `aikey` not found").
+        if det.state != tp::TpConfigState::OursActive {
+            return Some((tp::ReasonCode::TpBlockMissing, ctx(None)));
+        }
+        // 🔴 Never overwrite a FOREIGN value (2026-08-18 restore-fidelity).
+        if let Some(tp::CodexLever::Foreign { value }) = &det.codex_lever {
+            return Some((tp::ReasonCode::TpLeverForeign, ctx(Some(value.clone()))));
+        }
+        None
+    }
+
+    fn expected_after_merge(&self, det: &tp::Detection, input: &Self::Input) -> bool {
+        match input {
+            CodexInput::Scaffold { .. } => det.state == tp::TpConfigState::OursActive,
+            CodexInput::Lever(true) => det.codex_lever == Some(tp::CodexLever::On),
+            CodexInput::Lever(false) => det.codex_lever != Some(tp::CodexLever::On),
+        }
     }
 }
 
@@ -1357,116 +1547,44 @@ pub(super) fn codex_remove(existing: &str) -> TomlMergeOutcome {
 /// the caller's state projection keeps reporting "not taken over", which is the
 /// truth.
 pub fn set_codex_top_level_provider(on: bool) -> Result<(), String> {
-    let (config_path, _) = codex_config_paths();
-    let Ok(content) = std::fs::read_to_string(&config_path) else {
-        return Err("~/.codex/config.toml not found — open Codex once first".to_string());
-    };
-    let Some(mut doc) = parse_or_heal_toml(&content) else {
-        return Err("~/.codex/config.toml could not be parsed; not touching it".to_string());
-    };
-
-    if on {
-        let block_present = doc
-            .get("model_providers")
-            .and_then(|i| i.as_table())
-            .map(|t| t.contains_key("aikey"))
-            .unwrap_or(false);
-        if !block_present {
-            return Err(
-                "the aikey provider block is missing — activate an OpenAI key first".to_string(),
-            );
-        }
-        // 🔴 Never overwrite a FOREIGN value (2026-08-18, restore-fidelity
-        // gap): a user's own `model_provider = "ollama"` would be replaced by
-        // "aikey" here, and the reverse path deletes the line outright — the
-        // user's value would be gone. The lifecycle funnel has always had this
-        // rule (detect_codex_model_provider_conflict: conflicting value →
-        // top-level untouched, the CLI wrapper injects -c instead); the switch
-        // must not be the one path that skips it.
-        if let Some(existing_value) = doc.get("model_provider").and_then(|i| i.as_str()) {
-            if existing_value != "aikey" {
-                return Err(format!(
-                    "Codex's model_provider is set to '{existing_value}' (by you or another tool) — AiKey won't overwrite it. Remove that line from ~/.codex/config.toml first if you want AiKey to take over."
-                ));
+    // Through the guard: strict parse, refusals with the shared sentences
+    // (TP_BLOCK_MISSING / TP_LEVER_FOREIGN — the same words status --json
+    // shows), versioned backup, verify, one atomic write.
+    // spec: R-third-party-config-guard-2.S1 无写门旁路
+    let out = tp::apply(&CodexSurface, tp::TpOp::Merge(CodexInput::Lever(on)));
+    match out.action {
+        tp::TpAction::Refused | tp::TpAction::Failed => {
+            // Absent file when turning OFF is a no-op (nothing to reverse);
+            // when turning ON it is a real refusal.
+            if !on && out.state_before == tp::TpConfigState::Missing {
+                return Ok(());
             }
+            if out.state_before == tp::TpConfigState::Missing {
+                return Err("~/.codex/config.toml not found — open Codex once first".to_string());
+            }
+            Err(out
+                .sentence
+                .unwrap_or_else(|| "could not change ~/.codex/config.toml".to_string()))
         }
-        doc["model_provider"] = toml_edit::value("aikey");
-    } else {
-        // Only ever remove OUR value. A user who set `model_provider = "ollama"`
-        // keeps it: this switch reverses an aikey takeover, it does not own the
-        // field.
-        if doc.get("model_provider").and_then(|i| i.as_str()) != Some("aikey") {
-            return Ok(());
-        }
-        doc.as_table_mut().remove("model_provider");
+        _ => Ok(()),
     }
-
-    let rendered = doc.to_string();
-    if rendered == content {
-        return Ok(());
-    }
-    let config_dir = config_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| resolve_user_home().join(".codex"));
-    write_config_atomic(&config_dir, &config_path, &rendered)
-        .map_err(|e| format!("cannot write ~/.codex/config.toml: {e}"))
 }
 
-/// Restore `~/.codex/config.toml` from the backup created by `configure_codex_cli`.
+/// Remove aikey's routing from `~/.codex/config.toml` — structurally, our keys
+/// only, through the guard.
 ///
-/// Priority: (1) restore `config.aikey_backup.toml` wholesale; (2) failing
-/// that, strip both the AIKEY_BEGIN/END region AND every line carrying the
-/// `# managed by aikey` single-line marker. Never deletes non-aikey user
-/// content.
-pub fn unconfigure_codex_cli() {
-    let (config_path, backup_path) = codex_config_paths();
-
-    // Path 1: backup exists → restore wholesale.
-    if backup_path.exists() {
-        let _ = std::fs::rename(&backup_path, &config_path);
-        return;
-    }
-
-    let Ok(content) = std::fs::read_to_string(&config_path) else {
-        return;
-    };
-    let config_dir = config_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| resolve_user_home().join(".codex"));
-
-    // Path 2: structural removal of our keys/tables, preserving user content.
-    match codex_remove(&content) {
-        TomlMergeOutcome::Changed(out) => {
-            if out.trim().is_empty() {
-                let _ = std::fs::remove_file(&config_path);
-            } else {
-                let _ = write_config_atomic(&config_dir, &config_path, &out);
-            }
-        }
-        TomlMergeOutcome::Unchanged => {}
-        TomlMergeOutcome::SkipUnparseable => {
-            // Foreign-invalid file: fall back to the historical text strip
-            // (region + `# managed by aikey` marker lines) for pre-toml_edit
-            // installs that can no longer be parsed.
-            let stripped_region = strip_managed_region(&content).unwrap_or(content.clone());
-            let cleaned: String = stripped_region
-                .lines()
-                .filter(|line| !line.contains(CODEX_LINE_MARKER))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if cleaned.trim().is_empty() {
-                let _ = std::fs::remove_file(&config_path);
-            } else {
-                let mut final_content = cleaned;
-                if !final_content.ends_with('\n') {
-                    final_content.push('\n');
-                }
-                let _ = std::fs::write(&config_path, final_content);
-            }
-        }
-    }
+/// 🔴 Reversed 2026-09-05 (user decision, restore-fidelity): this used to
+/// rename the first-install backup over the file wholesale, discarding every
+/// change codex or the user made since; and on an unparseable file it fell
+/// back to deleting any line containing `# managed by aikey` with a plain
+/// `fs::write` (no backup, not atomic, not verified). Both paths are gone.
+/// An unparseable file is refused with the shared sentence; repair is
+/// `aikey hook repair codex --strip-ours` (explicit, backed up, verified).
+/// spec: R-third-party-config-guard-2.S2 / -3
+/// Returns the guard's outcome so a caller with a UX obligation (`hook
+/// uninstall codex`) does not print "removed" over a refusal.
+pub fn unconfigure_codex_cli() -> tp::SurfaceOutcome {
+    tp::apply(&CodexSurface, tp::TpOp::Remove)
 }
 
 // ---------------------------------------------------------------------------
@@ -1557,15 +1675,9 @@ pub(super) fn codex_config_paths() -> (std::path::PathBuf, std::path::PathBuf) {
 /// (20260728-端口漂移baseurl自愈回写); healing itself always goes through
 /// `configure_codex_cli` via the reconcile funnel.
 pub fn codex_local_baseurl_port() -> Option<u16> {
-    let (config_path, _) = codex_config_paths();
-    let text = std::fs::read_to_string(config_path).ok()?;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("openai_base_url") {
-            return crate::profile_activation::local_url_port(trimmed);
-        }
-    }
-    None
+    // From the guard's parsed read; an unparseable file yields None so the
+    // drift heal never runs against a file it cannot read.
+    codex_inspection().detection.local_baseurl_port
 }
 
 /// Format a relative-to-home path for display in user-facing messages.
@@ -3426,6 +3538,48 @@ fn strip_v1_block(contents: &str, v3_block: &str) -> String {
 mod hook_tests {
     use super::*;
 
+    // Text wrappers over the codex doc cores, kept ONLY for these tests
+    // (the guard calls the doc cores on an already strictly-parsed document).
+    #[derive(Debug, PartialEq, Eq)]
+    enum TomlMergeOutcome {
+        Changed(String),
+        Unchanged,
+        SkipUnparseable,
+    }
+
+    fn codex_merge(existing: &str, base_url: &str) -> (TomlMergeOutcome, bool) {
+        // Text wrapper kept for the pure-core tests; the guard calls
+        // `codex_merge_doc` on an already strictly-parsed document. No healing:
+        // an unparseable file is the user's file (DEC-third-party-config-guard-1).
+        let Ok(doc) = tp::parse_toml_strict(existing) else {
+            return (TomlMergeOutcome::SkipUnparseable, false);
+        };
+        let (out, written) = codex_merge_doc(doc, base_url);
+        let rendered = out.to_string();
+        let outcome = if rendered == existing {
+            TomlMergeOutcome::Unchanged
+        } else {
+            TomlMergeOutcome::Changed(rendered)
+        };
+        (outcome, written)
+    }
+
+    /// Pure core: remove aikey's Codex routing from an existing config, preserving
+    /// all user content. Removes `[model_providers.aikey]`, resets `model_provider`
+    /// if it is our value, and drops `openai_base_url` when it points at our proxy
+    /// (value ending in `/openai` — the shape `codex_base_url` writes).
+    fn codex_remove(existing: &str) -> TomlMergeOutcome {
+        let Ok(doc) = tp::parse_toml_strict(existing) else {
+            return TomlMergeOutcome::SkipUnparseable;
+        };
+        let out = codex_remove_doc(doc).to_string();
+        if out == existing {
+            TomlMergeOutcome::Unchanged
+        } else {
+            TomlMergeOutcome::Changed(out)
+        }
+    }
+
     // ── v3 hook content sanity ──────────────────────────────────────────────
 
     #[test]
@@ -4138,16 +4292,33 @@ max_steps_per_turn = 1000\n\
 tool_call_timeout_ms = 60000\n"
     }
 
+    /// Text wrappers over the guard's pure cores (the 07-04 fences keep their
+    /// shape; only the parse is strict now — no healing).
+    fn kmerge(existing: &str, cmd: &str) -> Result<String, tp::ParseFailure> {
+        use tp::Surface as _;
+        let doc = tp::parse_toml_strict(existing)?;
+        Ok(KimiSurface
+            .merge(
+                doc,
+                &KimiInput {
+                    hook_cmd: cmd.to_string(),
+                },
+            )
+            .expect("merge")
+            .to_string())
+    }
+    fn kremove(existing: &str) -> Result<String, tp::ParseFailure> {
+        use tp::Surface as _;
+        Ok(KimiSurface
+            .remove(tp::parse_toml_strict(existing)?)
+            .to_string())
+    }
+
     #[test]
     fn kimi_merge_into_empty_hooks_is_valid_and_single_hook() {
-        // THE regression: kimi wrote `hooks = []`; we must fold our Stop hook
-        // into it, not emit a second `hooks` of an incompatible TOML kind.
-        let out = match kimi_merge_hook(kimi_real_config_with_empty_hooks(), KIMI_HOOK_CMD) {
-            TomlMergeOutcome::Changed(s) => s,
-            other => panic!("expected Changed, got {other:?}"),
-        };
-        // Re-parses — this is what `kimi` does; before the fix it aborted with
-        // `Key "hooks" already exists`.
+        // THE regression (07-04): kimi wrote `hooks = []`; we must fold our
+        // Stop hook into it, not emit a second `hooks` of an incompatible kind.
+        let out = kmerge(kimi_real_config_with_empty_hooks(), KIMI_HOOK_CMD).expect("parses");
         let doc = out.parse::<toml_edit::Document>().expect("valid TOML");
         let aot = doc
             .get("hooks")
@@ -4170,10 +4341,7 @@ tool_call_timeout_ms = 60000\n"
 
     #[test]
     fn kimi_merge_empty_file_creates_hook() {
-        let out = match kimi_merge_hook("", KIMI_HOOK_CMD) {
-            TomlMergeOutcome::Changed(s) => s,
-            other => panic!("{other:?}"),
-        };
+        let out = kmerge("", KIMI_HOOK_CMD).unwrap();
         out.parse::<toml_edit::Document>().expect("valid TOML");
         assert!(out.contains("[[hooks]]"));
         assert!(out.contains("statusline render kimi"));
@@ -4181,25 +4349,16 @@ tool_call_timeout_ms = 60000\n"
 
     #[test]
     fn kimi_merge_is_idempotent() {
-        let once = match kimi_merge_hook(kimi_real_config_with_empty_hooks(), KIMI_HOOK_CMD) {
-            TomlMergeOutcome::Changed(s) => s,
-            other => panic!("{other:?}"),
-        };
-        // Re-running over our own output must not rewrite (no `aikey use` churn).
-        assert_eq!(
-            kimi_merge_hook(&once, KIMI_HOOK_CMD),
-            TomlMergeOutcome::Unchanged
-        );
+        let once = kmerge(kimi_real_config_with_empty_hooks(), KIMI_HOOK_CMD).unwrap();
+        // Re-running over our own output must be byte-identical (no `aikey use` churn).
+        assert_eq!(kmerge(&once, KIMI_HOOK_CMD).unwrap(), once);
     }
 
     #[test]
     fn kimi_merge_preserves_foreign_hook() {
         let existing =
             "[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"user-thing\"\ntimeout = 10\n";
-        let out = match kimi_merge_hook(existing, KIMI_HOOK_CMD) {
-            TomlMergeOutcome::Changed(s) => s,
-            other => panic!("{other:?}"),
-        };
+        let out = kmerge(existing, KIMI_HOOK_CMD).unwrap();
         let doc = out.parse::<toml_edit::Document>().expect("valid");
         let aot = doc
             .get("hooks")
@@ -4210,40 +4369,62 @@ tool_call_timeout_ms = 60000\n"
         assert!(out.contains(KIMI_HOOK_CMD));
     }
 
+    /// REVERSED 2026-09-05 (third-party-config-guard, user decision "坏文件只
+    /// 诊断不动手"): the shipped 07-04 corruption (kimi's `hooks = []` PLUS our
+    /// old appended marker region with `[[hooks]]`) used to be silently
+    /// "healed" by guessing which lines were ours. Now the strict parse
+    /// refuses it, and `hook repair kimi --strip-ours` removes exactly our
+    /// region — the same grammar-driven strip, but under the user's consent
+    /// and with a backup first.
     #[test]
-    fn kimi_merge_self_heals_previously_corrupted_file() {
-        // Exact shape of the shipped bug: kimi's `hooks = []` PLUS our old
-        // appended marker region with `[[hooks]]` = invalid TOML. parse_or_heal
-        // strips our region, then the merge folds cleanly into a single hook.
+    fn kimi_previously_corrupted_file_is_refused_not_healed_and_repair_strips_ours() {
         let broken = format!(
             "default_model = \"\"\nhooks = []\n\n{AIKEY_BEGIN}\n[[hooks]]\nevent = \"Stop\"\ncommand = \"{KIMI_HOOK_CMD}\"\ntimeout = 5\n{AIKEY_END}\n"
         );
         assert!(
-            broken.parse::<toml_edit::Document>().is_err(),
-            "fixture must reproduce the broken (duplicate-key) state"
+            tp::parse_toml_strict(&broken).is_err(),
+            "fixture must reproduce the broken state"
         );
-        let out = match kimi_merge_hook(&broken, KIMI_HOOK_CMD) {
-            TomlMergeOutcome::Changed(s) => s,
-            other => panic!("expected self-heal, got {other:?}"),
-        };
-        let doc = out
-            .parse::<toml_edit::Document>()
-            .expect("healed valid TOML");
-        let aot = doc
-            .get("hooks")
-            .and_then(|i| i.as_array_of_tables())
-            .unwrap();
-        assert_eq!(aot.len(), 1, "one merged hook after heal:\n{out}");
+        assert!(
+            kmerge(&broken, KIMI_HOOK_CMD).is_err(),
+            "no healing on the automatic path"
+        );
+        assert!(
+            !kimi_content_has_aikey(&broken),
+            "unparseable → no verdict (lockstep with remove)"
+        );
+        let plan = tp::strip_owned_text(&broken, &KIMI_OWNED_GRAMMAR);
+        let fixed = plan.result;
+        let doc = tp::parse_toml_strict(&fixed).expect("parses after removing only our region");
+        assert!(
+            fixed.contains("hooks = []") && fixed.contains("default_model = \"\""),
+            "{fixed}"
+        );
+        assert!(!fixed.contains("aikey"), "{fixed}");
+        use tp::Surface as _;
+        assert_eq!(
+            KimiSurface.detect(&doc).state,
+            tp::TpConfigState::PresentNoAikey
+        );
+        // …and the next `use` merges cleanly into the repaired file.
+        let merged = kmerge(&fixed, KIMI_HOOK_CMD).unwrap();
+        let n = merged.parse::<toml_edit::Document>().unwrap()["hooks"]
+            .as_array_of_tables()
+            .unwrap()
+            .len();
+        assert_eq!(n, 1);
     }
 
     #[test]
-    fn kimi_merge_skips_foreign_unparseable() {
-        // Invalid for a reason we did NOT cause → leave it alone (no overwrite).
+    fn kimi_merge_refuses_foreign_unparseable() {
+        // Invalid for a reason we did NOT cause → the strict parse says so and
+        // nothing downstream runs (the guard prints the sentence, writes nothing).
         let foreign_bad = "not valid = = toml [[[\n";
-        assert_eq!(
-            kimi_merge_hook(foreign_bad, KIMI_HOOK_CMD),
-            TomlMergeOutcome::SkipUnparseable
-        );
+        let err = kmerge(foreign_bad, KIMI_HOOK_CMD).expect_err("must not parse");
+        assert!(err.line.is_some(), "{err:?}");
+        // strip-ours cannot fix what is not ours: still unparseable after the plan.
+        let plan = tp::strip_owned_text(foreign_bad, &KIMI_OWNED_GRAMMAR);
+        assert!(plan.removed.is_empty() && tp::parse_toml_strict(&plan.result).is_err());
     }
 
     #[test]
@@ -4251,10 +4432,7 @@ tool_call_timeout_ms = 60000\n"
         let existing = format!(
             "[[hooks]]\nevent = \"Stop\"\ncommand = \"{KIMI_HOOK_CMD}\"\ntimeout = 5\n\n[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"user\"\ntimeout = 3\n"
         );
-        let out = match kimi_remove_hook(&existing) {
-            TomlMergeOutcome::Changed(s) => s,
-            other => panic!("{other:?}"),
-        };
+        let out = kremove(&existing).unwrap();
         let doc = out.parse::<toml_edit::Document>().unwrap();
         let aot = doc
             .get("hooks")
@@ -4268,54 +4446,101 @@ tool_call_timeout_ms = 60000\n"
     #[test]
     fn kimi_remove_hook_noop_when_none_ours() {
         let existing = "[[hooks]]\nevent = \"Stop\"\ncommand = \"user\"\ntimeout = 3\n";
-        assert_eq!(kimi_remove_hook(existing), TomlMergeOutcome::Unchanged);
+        assert_eq!(
+            kremove(existing).unwrap(),
+            existing,
+            "byte-identical → the guard reports Unchanged"
+        );
     }
 
     #[test]
-    fn kimi_strip_legacy_default_model_removes_matching_top_level() {
-        let input =
-            "default_model = \"kimi-k2-5\"\ndefault_thinking = false\n[loop_control]\nmax = 10\n";
-        let out = strip_legacy_kimi_default_model(input);
-        assert!(!out.contains("default_model = \"kimi-k2-5\""));
-        assert!(out.contains("default_thinking = false"));
-        assert!(out.contains("[loop_control]"));
-        assert!(out.contains("max = 10"));
+    fn kimi_legacy_default_model_dropped_structurally_on_merge() {
+        // Our historical default → dropped (it points at a [models.*] block we
+        // no longer write; kimi rejects it).
+        let out = kmerge(
+            "default_model = \"kimi-k2-5\"\ndefault_thinking = false\n[loop_control]\nmax = 10\n",
+            KIMI_HOOK_CMD,
+        )
+        .unwrap();
+        assert!(!out.contains("default_model = \"kimi-k2-5\""), "{out}");
+        assert!(
+            out.contains("default_thinking = false")
+                && out.contains("[loop_control]")
+                && out.contains("max = 10")
+        );
     }
 
     #[test]
-    fn kimi_strip_legacy_default_model_preserves_user_custom_value() {
-        // Users who picked a non-aikey-default value must be preserved.
-        let input = "default_model = \"kimi-dev\"\n[loop_control]\n";
-        let out = strip_legacy_kimi_default_model(input);
-        assert!(out.contains("default_model = \"kimi-dev\""));
+    fn kimi_legacy_default_model_user_value_preserved() {
+        let out = kmerge(
+            "default_model = \"kimi-dev\"\n[loop_control]\n",
+            KIMI_HOOK_CMD,
+        )
+        .unwrap();
+        assert!(out.contains("default_model = \"kimi-dev\""), "{out}");
     }
 
     #[test]
-    fn kimi_strip_legacy_default_model_ignores_inside_table() {
-        // A `default_model = ...` line AFTER a [table] header is a sub-key
-        // (e.g. `[some.plugin]\ndefault_model = "..."`), not our target.
-        let input = "[some.plugin]\ndefault_model = \"kimi-k2-5\"\n";
-        let out = strip_legacy_kimi_default_model(input);
-        assert!(out.contains("default_model = \"kimi-k2-5\""));
+    fn kimi_legacy_default_model_inside_table_is_not_ours() {
+        // `[some.plugin]\ndefault_model = ...` is a sub-key, never our top-level key.
+        let out = kmerge(
+            "[some.plugin]\ndefault_model = \"kimi-k2-5\"\n",
+            KIMI_HOOK_CMD,
+        )
+        .unwrap();
+        assert!(out.contains("default_model = \"kimi-k2-5\""), "{out}");
+        // …and the repair grammar agrees: top-level only.
+        let plan = tp::strip_owned_text(
+            "[some.plugin]\ndefault_model = \"kimi-k2-5\"\n",
+            &KIMI_OWNED_GRAMMAR,
+        );
+        assert!(plan.removed.is_empty());
     }
 
     #[test]
-    fn kimi_strip_region_removes_region_and_one_trailing_newline() {
-        // strip_managed_region is retained for self-heal + uninstall fallback.
+    fn kimi_repair_grammar_strips_legacy_region_and_keeps_user_comment() {
         let region =
             format!("{AIKEY_BEGIN}\n[[hooks]]\nevent = \"Stop\"\ntimeout = 5\n{AIKEY_END}");
         let existing = format!("default_thinking = false\n\n{region}\n\n# user\n");
-        let out = strip_managed_region(&existing).unwrap();
-        assert!(out.starts_with("default_thinking = false\n\n"));
-        assert!(!out.contains(AIKEY_BEGIN));
-        assert!(!out.contains(AIKEY_END));
-        assert!(out.contains("# user"));
+        let plan = tp::strip_owned_text(&existing, &KIMI_OWNED_GRAMMAR);
+        assert!(plan.result.starts_with("default_thinking = false\n"));
+        assert!(!plan.result.contains(AIKEY_BEGIN) && !plan.result.contains(AIKEY_END));
+        assert!(plan.result.contains("# user"));
     }
 
+    /// detect ⇔ remove lockstep for kimi (codex has had this since 07-07;
+    /// kimi never did): "would `unuse` change bytes" must equal "display says
+    /// wired", over every shape we know — including the unparseable one,
+    /// where both answer "no".
     #[test]
-    fn kimi_strip_region_returns_none_when_absent() {
-        let plain = "default_model = \"x\"\n";
-        assert!(strip_managed_region(plain).is_none());
+    fn kimi_detection_lockstep_with_remove() {
+        let wired = format!("default_model = \"k2\"\n\n[[hooks]]\nevent = \"Stop\"\ncommand = \"{KIMI_HOOK_CMD}\"\ntimeout = 5\n");
+        let user_hook =
+            "[[hooks]]\nevent = \"Stop\"\ncommand = \"user\"\ntimeout = 3\n".to_string();
+        let both = format!("{user_hook}\n[[hooks]]\nevent = \"Stop\"\ncommand = \"{KIMI_HOOK_CMD}\"\ntimeout = 5\n");
+        let markers_only =
+            format!("{AIKEY_BEGIN}\n# nothing\n{AIKEY_END}\ndefault_model = \"k2\"\n");
+        let inline_ours = format!(
+            "hooks = [{{ event = \"Stop\", command = \"{KIMI_HOOK_CMD}\", timeout = 5 }}]\n"
+        );
+        let broken = "hooks = []\n[[hooks]]\nevent = \"Stop\"\n".to_string();
+        for (name, text) in [
+            ("wired", wired),
+            ("user_hook", user_hook),
+            ("both", both),
+            ("markers_only", markers_only),
+            ("inline_ours", inline_ours),
+            ("vanilla", kimi_real_config_with_empty_hooks().to_string()),
+            ("empty", String::new()),
+            ("broken", broken),
+        ] {
+            let detected = kimi_content_has_aikey(&text);
+            let changed = kremove(&text).map(|out| out != text).unwrap_or(false);
+            assert_eq!(
+                detected, changed,
+                "{name}: detect={detected} remove-changes={changed}\n{text}"
+            );
+        }
     }
 
     // ── Codex merge (toml_edit structural) ───────────────────────────────────
@@ -4654,10 +4879,19 @@ tool_call_timeout_ms = 60000\n"
     }
 
     #[test]
-    fn codex_conflict_ignores_value_when_own_marker_present() {
-        // Our own write even with value == "custom-thing" must not self-report as conflict.
+    fn codex_conflict_is_decided_by_the_value_not_by_our_marker() {
+        // REVERSED 2026-09-05 (third-party-config-guard, DEC-third-party-config-guard-3):
+        // the `# managed by aikey` comment used to exempt ANY value from the
+        // foreign check. The guard keys ownership on aikey's own key grammar —
+        // `model_provider` is ours only when its value is "aikey". A line
+        // carrying our marker but someone else's value was edited by someone
+        // else; overwriting it would lose their value (restore-fidelity), so
+        // it must be reported as foreign. The marker never decides anything.
         let content = "model_provider = \"anything\"  # managed by aikey\n";
-        assert_eq!(detect_codex_model_provider_conflict(content), None);
+        assert_eq!(
+            detect_codex_model_provider_conflict(content),
+            Some("anything".to_string())
+        );
     }
 
     // ── Stage 4 (active-state cross-shell sync, 2026-04-27) regression ──────
@@ -7268,5 +7502,780 @@ mod hook_uninstall_tests {
             cleaned.contains("# user") && cleaned.contains("# tail"),
             "user content kept"
         );
+    }
+}
+
+// ── Guard behaviour on an unparseable codex file (from the 2026-09-04 spike) ─
+//
+// These began as five print-only replays of the winpc2 incident. They are now
+// assertions: an unparseable file is REFUSED by both `use` and `unuse`
+// (bytes and mtime untouched, no backup written), `hook repair --strip-ours`
+// removes only aikey's own lines and leaves the user's provider intact.
+// spec: R-third-party-config-guard-1.S2 / -2.S2 / -3.S1
+#[cfg(test)]
+mod tp_invalid_file_suite {
+    use super::*;
+    use crate::test_env_lock::ENV_MUTATION_LOCK;
+    use tp::Surface as _;
+
+    const TAIL: &str = "\n[features]\nx = 1\n\n[desktop]\ny = 2\n";
+
+    /// The winpc2 shape: our scaffold + the user's own provider + a duplicate
+    /// top-level key (invalid TOML).
+    fn duplicate_key_pre_image() -> String {
+        format!(
+            "# codex config\nmodel_provider = \"aikey\"\nopenai_base_url = \"http://127.0.0.1:27200/openai\"\n\n\
+             model_provider = \"pingtoken\"\n\n[model_providers.pingtoken]\nname = \"PingToken\"\n\
+             base_url = \"https://api.pingtoken.example/v1\"\nenv_key = \"PINGTOKEN_API_KEY\"\nwire_api = \"responses\"\n{TAIL}\n\
+             [model_providers.aikey]\nname = \"aikey\"\nbase_url = \"http://127.0.0.1:27200/openai\"\n\
+             experimental_bearer_token = \"aikey_active_openai\"\nwire_api = \"responses\"\nrequires_openai_auth = false\n"
+        )
+    }
+
+    struct Sandbox {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        _tmp: tempfile::TempDir,
+        prev_home: Option<std::ffi::OsString>,
+        prev_up: Option<std::ffi::OsString>,
+        prev_ccd: Option<std::ffi::OsString>,
+        cfg: std::path::PathBuf,
+    }
+
+    impl Sandbox {
+        fn at(rel_dir: &str, content: Option<&str>) -> Self {
+            let guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let tmp = tempfile::tempdir().expect("tmp");
+            let prev_home = std::env::var_os("HOME");
+            let prev_up = std::env::var_os("USERPROFILE");
+            let prev_ccd = std::env::var_os("CLAUDE_CONFIG_DIR");
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("USERPROFILE", tmp.path());
+            // The developer's shell may point CLAUDE_CONFIG_DIR at a real
+            // persona; pin it inside the sandbox so claude paths resolve here.
+            std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path().join(".claude"));
+            let dir = tmp.path().join(rel_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let cfg = dir.join(if rel_dir == ".claude" {
+                "settings.json"
+            } else {
+                "config.toml"
+            });
+            if let Some(c) = content {
+                std::fs::write(&cfg, c).unwrap();
+            }
+            Sandbox {
+                _guard: guard,
+                _tmp: tmp,
+                prev_home,
+                prev_up,
+                prev_ccd,
+                cfg,
+            }
+        }
+        fn with_claude(content: Option<&str>) -> Self {
+            Sandbox::at(".claude", content)
+        }
+        fn with(content: &str) -> Self {
+            Sandbox::at(".codex", Some(content))
+        }
+        /// Same sandbox, kimi's file instead of codex's.
+        fn with_kimi(content: Option<&str>) -> Self {
+            Sandbox::at(".kimi", content)
+        }
+        fn dir_entries(&self) -> usize {
+            std::fs::read_dir(self.cfg.parent().unwrap())
+                .unwrap()
+                .count()
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            match &self.prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.prev_up {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+            match &self.prev_ccd {
+                Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+                None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_key_is_config_invalid_and_use_unuse_refuse_without_touching_bytes() {
+        let sb = Sandbox::with(&duplicate_key_pre_image());
+        let before_bytes = std::fs::read(&sb.cfg).unwrap();
+        let before_entries = sb.dir_entries();
+
+        let insp = codex_inspection();
+        assert!(
+            insp.detection.state.is_unparseable(),
+            "{:?}",
+            insp.detection.state
+        );
+        let sentence = insp.unparseable_sentence().expect("sentence");
+        assert!(
+            sentence.contains("aikey hook repair codex --strip-ours"),
+            "{sentence}"
+        );
+        assert!(sentence.contains("line "), "{sentence}");
+
+        let commits_before = tp::TP_COMMITS.load(std::sync::atomic::Ordering::SeqCst);
+        // `aikey use <openai>` path
+        let out = tp::apply(
+            &CodexSurface,
+            tp::TpOp::Merge(CodexInput::Scaffold {
+                base_url: "http://127.0.0.1:27200/openai".into(),
+            }),
+        );
+        assert_eq!(out.action, tp::TpAction::Refused);
+        assert_eq!(out.reason_code, Some(tp::ReasonCode::TpConfigUnparseable));
+        assert_eq!(
+            out.sentence.as_deref(),
+            Some(sentence.as_str()),
+            "one sentence, every surface"
+        );
+        // `aikey unuse openai` path — the old text-strip fallback is gone.
+        let out = tp::apply(&CodexSurface, tp::TpOp::Remove);
+        assert_eq!(out.action, tp::TpAction::Refused);
+        // desktop lever path
+        assert!(set_codex_top_level_provider(true).is_err());
+
+        assert_eq!(
+            std::fs::read(&sb.cfg).unwrap(),
+            before_bytes,
+            "bytes must be untouched"
+        );
+        assert_eq!(
+            sb.dir_entries(),
+            before_entries,
+            "no backup, no temp file, nothing new"
+        );
+        assert_eq!(
+            tp::TP_COMMITS.load(std::sync::atomic::Ordering::SeqCst),
+            commits_before,
+            "the write door must not have opened"
+        );
+    }
+
+    #[test]
+    fn strip_ours_repairs_our_duplicate_and_keeps_the_users_provider() {
+        // Both `model_provider = "aikey"` lines are ours → removable; the
+        // user's PingToken table must survive byte-for-byte.
+        let text = duplicate_key_pre_image().replace(
+            "model_provider = \"pingtoken\"",
+            "model_provider = \"aikey\"",
+        );
+        let plan = tp::strip_owned_text(&text, &CODEX_OWNED_GRAMMAR);
+        let doc = tp::parse_toml_strict(&plan.result).expect("parses after stripping ours");
+        assert!(plan.result.contains("[model_providers.pingtoken]"));
+        assert!(plan.result.contains("env_key = \"PINGTOKEN_API_KEY\""));
+        assert!(!plan.result.contains("model_providers.aikey"));
+        assert_eq!(
+            CodexSurface.detect(&doc).state,
+            tp::TpConfigState::PresentNoAikey
+        );
+    }
+
+    #[test]
+    fn strip_ours_cannot_fix_a_foreign_duplicate_and_says_so() {
+        let text = duplicate_key_pre_image().replace(
+            "model_provider = \"aikey\"",
+            "model_provider = \"pingtoken\"",
+        );
+        let plan = tp::strip_owned_text(&text, &CODEX_OWNED_GRAMMAR);
+        assert!(
+            tp::parse_toml_strict(&plan.result).is_err(),
+            "two foreign lines remain → still invalid"
+        );
+    }
+
+    #[test]
+    fn repair_strip_ours_asks_first_then_fixes_our_duplicate_and_keeps_the_users_provider() {
+        // winpc2 shape, but BOTH lever lines are ours (the case --strip-ours can fix).
+        let text = duplicate_key_pre_image().replace(
+            "model_provider = \"pingtoken\"",
+            "model_provider = \"aikey\"",
+        );
+        let sb = Sandbox::with(&text);
+        let before = std::fs::read(&sb.cfg).unwrap();
+        let commits = tp::TP_COMMITS.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Diagnose never writes and carries THE sentence.
+        let r = tp::repair(&CodexSurface, tp::RepairMode::Diagnose, true);
+        assert!(r.state.is_unparseable());
+        assert_eq!(
+            r.sentence,
+            codex_inspection().unparseable_sentence(),
+            "hook repair head == status blocked_reason"
+        );
+        assert!(r.outcome.is_none());
+
+        // Without consent: preview filled, refused, bytes untouched, no backup.
+        let r = tp::repair(&CodexSurface, tp::RepairMode::StripOurs, false);
+        let o = r.outcome.as_ref().expect("outcome");
+        assert_eq!(o.reason_code, Some(tp::ReasonCode::TpNeedsConfirmation));
+        assert_eq!(r.exit_code(), 2);
+        assert!(!r.preview.is_empty(), "preview lists our lines");
+        assert!(
+            r.preview.iter().all(|(_, l)| l.contains("aikey")
+                || l.trim().is_empty()
+                || l.starts_with("name")
+                || l.starts_with("base_url")
+                || l.starts_with("experimental_bearer_token")
+                || l.starts_with("wire_api")
+                || l.starts_with("requires_openai_auth")
+                || l.starts_with("openai_base_url")),
+            "{:?}",
+            r.preview
+        );
+        assert_eq!(std::fs::read(&sb.cfg).unwrap(), before);
+        assert_eq!(
+            tp::TP_COMMITS.load(std::sync::atomic::Ordering::SeqCst),
+            commits
+        );
+        assert!(tp::list_backups(&sb.cfg).is_empty());
+
+        // With consent: backup first, then only our lines go; PingToken survives.
+        let r = tp::repair(&CodexSurface, tp::RepairMode::StripOurs, true);
+        let o = r.outcome.as_ref().expect("outcome");
+        assert_eq!(o.action, tp::TpAction::Stripped, "{o:?}");
+        assert_eq!(r.exit_code(), 0);
+        let backup = o.backup_path.clone().expect("versioned backup");
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            before,
+            "backup is the pre-image"
+        );
+        let after = std::fs::read_to_string(&sb.cfg).unwrap();
+        tp::parse_toml_strict(&after).expect("parses after repair");
+        assert!(
+            after.contains("[model_providers.pingtoken]")
+                && after.contains("env_key = \"PINGTOKEN_API_KEY\"")
+        );
+        assert!(!after.contains("aikey"), "{after}");
+        assert_eq!(
+            codex_inspection().detection.state,
+            tp::TpConfigState::PresentNoAikey
+        );
+        assert_eq!(
+            tp::TP_COMMITS.load(std::sync::atomic::Ordering::SeqCst),
+            commits + 1
+        );
+    }
+
+    #[test]
+    fn repair_strip_ours_reports_insufficient_when_the_duplicate_is_not_ours() {
+        let text = duplicate_key_pre_image().replace(
+            "model_provider = \"aikey\"",
+            "model_provider = \"pingtoken\"",
+        );
+        let sb = Sandbox::with(&text);
+        let before = std::fs::read(&sb.cfg).unwrap();
+        let r = tp::repair(&CodexSurface, tp::RepairMode::StripOurs, true);
+        let o = r.outcome.as_ref().expect("outcome");
+        assert_eq!(
+            o.reason_code,
+            Some(tp::ReasonCode::TpRepairInsufficient),
+            "{o:?}"
+        );
+        assert_eq!(r.exit_code(), 2);
+        assert!(o.sentence.as_deref().unwrap_or("").contains("not aikey's"));
+        assert_eq!(
+            std::fs::read(&sb.cfg).unwrap(),
+            before,
+            "not one byte written"
+        );
+        assert!(
+            tp::list_backups(&sb.cfg).is_empty(),
+            "no backup for a refused repair"
+        );
+    }
+
+    #[test]
+    fn repair_from_backup_copies_without_consuming_the_backup() {
+        let sb = Sandbox::with("model_provider = \"pingtoken\"\n");
+        // A use → a backup of the user-only file exists.
+        let out = tp::apply(
+            &CodexSurface,
+            tp::TpOp::Merge(CodexInput::Scaffold {
+                base_url: "http://127.0.0.1:27200/openai".into(),
+            }),
+        );
+        let backup = out.backup_path.expect("backup");
+        // Break the file the way the incident did: a SECOND top-level
+        // model_provider (prepended — appended it would land inside the last
+        // table and parse fine).
+        let broken = format!(
+            "model_provider = \"aikey\"\n{}",
+            std::fs::read_to_string(&sb.cfg).unwrap()
+        );
+        std::fs::write(&sb.cfg, &broken).unwrap();
+        assert!(codex_inspection().detection.state.is_unparseable());
+
+        let r = tp::repair(&CodexSurface, tp::RepairMode::FromBackup(None), false);
+        assert_eq!(
+            r.outcome.as_ref().unwrap().reason_code,
+            Some(tp::ReasonCode::TpNeedsConfirmation)
+        );
+        assert_eq!(std::fs::read_to_string(&sb.cfg).unwrap(), broken);
+
+        let r = tp::repair(&CodexSurface, tp::RepairMode::FromBackup(None), true);
+        let o = r.outcome.as_ref().unwrap();
+        assert_eq!(o.action, tp::TpAction::Restored, "{o:?}");
+        assert_eq!(
+            std::fs::read_to_string(&sb.cfg).unwrap(),
+            "model_provider = \"pingtoken\"\n"
+        );
+        assert!(
+            backup.exists(),
+            "restore copies; the backup is never consumed"
+        );
+        let pre = o
+            .backup_path
+            .clone()
+            .expect("the broken content was backed up before restore");
+        assert_eq!(std::fs::read_to_string(pre).unwrap(), broken);
+    }
+
+    /// A readable file is not "repaired": `--strip-ours` refuses (exit 2,
+    /// bytes untouched) and points at `hook uninstall`. The plan's negative
+    /// case: a foreign lever on a VALID file must not lose the provider block.
+    #[test]
+    fn repair_strip_ours_refuses_a_file_that_reads_fine() {
+        let sb = Sandbox::with(
+            "model_provider = \"openrouter\"\n\n[model_providers.aikey]\nname = \"aikey\"\nbase_url = \"http://127.0.0.1:27200/openai\"\n",
+        );
+        let before = std::fs::read(&sb.cfg).unwrap();
+        assert_eq!(
+            codex_inspection().detection.state,
+            tp::TpConfigState::OursActive
+        );
+        let r = tp::repair(&CodexSurface, tp::RepairMode::StripOurs, true);
+        let o = r.outcome.as_ref().unwrap();
+        assert_eq!(
+            o.reason_code,
+            Some(tp::ReasonCode::TpNotApplicable),
+            "{o:?}"
+        );
+        assert_eq!(r.exit_code(), 2);
+        assert!(o
+            .sentence
+            .as_deref()
+            .unwrap_or("")
+            .contains("hook uninstall codex"));
+        assert_eq!(
+            std::fs::read(&sb.cfg).unwrap(),
+            before,
+            "not one byte written"
+        );
+        assert!(tp::list_backups(&sb.cfg).is_empty());
+    }
+
+    #[test]
+    fn repair_from_backup_with_no_backup_refuses() {
+        let sb = Sandbox::with("model_provider = \"aikey\"\nmodel_provider = \"aikey\"\n");
+        let r = tp::repair(&CodexSurface, tp::RepairMode::FromBackup(None), true);
+        assert_eq!(
+            r.outcome.as_ref().unwrap().reason_code,
+            Some(tp::ReasonCode::TpNoBackup)
+        );
+        assert_eq!(r.exit_code(), 2);
+        assert!(sb.cfg.exists());
+    }
+
+    // ── kimi (Phase 2, 2026-09-05) ──────────────────────────────────────────
+    // spec: R-third-party-config-guard-7
+
+    fn kimi_hook_cmd() -> String {
+        crate::commands_statusline::aikey_statusline_render_kimi_command()
+    }
+
+    /// The 07-04 corruption shape on disk: `use` refuses (no heal), the
+    /// shell-hook row carries the sentence, uninstall says ConfigInvalid, and
+    /// `hook repair kimi --strip-ours` is what fixes it.
+    #[test]
+    fn kimi_broken_file_is_refused_everywhere_and_repair_strips_ours() {
+        let broken = format!(
+            "default_model = \"\"\nhooks = []\n\n{AIKEY_BEGIN}\n[[hooks]]\nevent = \"Stop\"\ncommand = \"{}\"\ntimeout = 5\n{AIKEY_END}\n",
+            kimi_hook_cmd()
+        );
+        let sb = Sandbox::with_kimi(Some(&broken));
+        let before = std::fs::read(&sb.cfg).unwrap();
+        let commits = tp::TP_COMMITS.load(std::sync::atomic::Ordering::SeqCst);
+
+        let out = configure_kimi_cli(27200).expect("non-TTY: no prompt, always an outcome");
+        assert_eq!(out.action, tp::TpAction::Refused, "{out:?}");
+        assert_eq!(out.reason_code, Some(tp::ReasonCode::TpConfigUnparseable));
+        let sentence = out.sentence.clone().unwrap();
+        assert!(
+            sentence.contains("aikey hook repair kimi --strip-ours"),
+            "{sentence}"
+        );
+
+        // Everyone reads the same verdict.
+        assert_eq!(kimi_status(), (false, false));
+        assert!(
+            matches!(uninstall_kimi_hook(), KimiUninstallOutcome::ConfigInvalid(s) if s == sentence)
+        );
+        let listed = unreadable_provider_configs();
+        assert!(
+            listed
+                .iter()
+                .any(|(n, _, s)| *n == "kimi" && *s == sentence),
+            "{listed:?}"
+        );
+        let rows = crate::commands_account::status_integrations(true);
+        let hook_row = rows.iter().find(|r| r["id"] == "shell-hook").unwrap();
+        assert_eq!(
+            hook_row["detail"].as_str(),
+            Some(sentence.as_str()),
+            "shell-hook row detail == guard sentence"
+        );
+        assert!(
+            hook_row["blocked_reason"].is_null(),
+            "informational only: the hook switch stays operable"
+        );
+
+        assert_eq!(std::fs::read(&sb.cfg).unwrap(), before, "bytes untouched");
+        assert_eq!(
+            tp::TP_COMMITS.load(std::sync::atomic::Ordering::SeqCst),
+            commits
+        );
+        assert!(tp::list_backups(&sb.cfg).is_empty());
+
+        // Repair (consented) removes only our region; the file parses; kimi's
+        // own `hooks = []` survives; the next use merges cleanly.
+        let r = tp::repair(&KimiSurface, tp::RepairMode::StripOurs, true);
+        assert_eq!(
+            r.outcome.as_ref().unwrap().action,
+            tp::TpAction::Stripped,
+            "{:?}",
+            r.outcome
+        );
+        let fixed = std::fs::read_to_string(&sb.cfg).unwrap();
+        assert!(
+            fixed.contains("hooks = []") && !fixed.contains("aikey"),
+            "{fixed}"
+        );
+        assert_eq!(
+            std::fs::read(r.outcome.as_ref().unwrap().backup_path.as_ref().unwrap()).unwrap(),
+            before
+        );
+        let out = configure_kimi_cli(27200).unwrap();
+        assert_eq!(out.action, tp::TpAction::Merged, "{out:?}");
+        assert_eq!(kimi_status(), (true, true));
+        assert!(crate::commands_account::status_integrations(true)
+            .iter()
+            .find(|r| r["id"] == "shell-hook")
+            .unwrap()["detail"]
+            .is_null());
+    }
+
+    /// Healthy paths: create (no backup — nothing to back up), merge into a
+    /// user file (versioned backup), remove keeps the user's keys and never
+    /// consumes the backup, and a file holding only our hook is deleted.
+    #[test]
+    fn kimi_use_and_unuse_are_structural_with_versioned_backups() {
+        // 1. no file at all → created, nothing backed up
+        let sb = Sandbox::with_kimi(None);
+        let out = configure_kimi_cli(27200).unwrap();
+        assert_eq!(out.action, tp::TpAction::Created, "{out:?}");
+        assert!(out.backup_path.is_none());
+        assert_eq!(kimi_status(), (true, true));
+        // 2. only our hook in it → unuse deletes the file we created
+        let out = unconfigure_kimi_cli();
+        assert_eq!(out.action, tp::TpAction::Deleted, "{out:?}");
+        assert!(!sb.cfg.exists());
+        assert!(matches!(
+            uninstall_kimi_hook(),
+            KimiUninstallOutcome::NothingToRemove
+        ));
+
+        // 3. user file → merged with a versioned backup; unuse strips only ours
+        let user = "default_model = \"kimi-dev\"\nhooks = []\ntelemetry = true\n\n[loop_control]\nmax_steps_per_turn = 1000\n";
+        std::fs::write(&sb.cfg, user).unwrap();
+        let out = configure_kimi_cli(27200).unwrap();
+        assert_eq!(out.action, tp::TpAction::Merged, "{out:?}");
+        let backup = out
+            .backup_path
+            .clone()
+            .expect("backup before the first byte changes");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), user);
+        let merged = std::fs::read_to_string(&sb.cfg).unwrap();
+        assert!(
+            merged.contains("[[hooks]]") && merged.contains("default_model = \"kimi-dev\""),
+            "{merged}"
+        );
+        assert_eq!(
+            configure_kimi_cli(27200).unwrap().action,
+            tp::TpAction::Unchanged,
+            "idempotent"
+        );
+        assert!(matches!(
+            uninstall_kimi_hook(),
+            KimiUninstallOutcome::Removed
+        ));
+        let after = std::fs::read_to_string(&sb.cfg).unwrap();
+        assert!(!after.contains("aikey"), "{after}");
+        assert!(
+            after.contains("default_model = \"kimi-dev\"") && after.contains("[loop_control]"),
+            "{after}"
+        );
+        assert!(backup.exists(), "backups are never consumed");
+        // The legacy single-slot backup name is never written any more.
+        assert!(!sb.cfg.with_file_name("config.aikey_backup.toml").exists());
+    }
+
+    // ── claude settings.json (Phase 3, 2026-09-05) ─────────────────────────
+    // spec: R-third-party-config-guard-8
+
+    use crate::commands_statusline::{self as sl, ClaudeSurface, InstallOutcome};
+
+    #[test]
+    fn claude_malformed_settings_is_refused_everywhere_and_json_repair_is_backup_only() {
+        let broken = "{ \"theme\": \"dark\", \"statusLine\": { \"type\": \"command\", ";
+        let sb = Sandbox::with_claude(Some(broken));
+        let before = std::fs::read(&sb.cfg).unwrap();
+        let commits = tp::TP_COMMITS.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(
+            sl::install_claude(false).unwrap(),
+            InstallOutcome::RefusedMalformed
+        );
+        sl::ensure().unwrap(); // wrapper path: silent no-op
+        sl::uninstall_claude(true).unwrap();
+        assert_eq!(
+            std::fs::read(&sb.cfg).unwrap(),
+            before,
+            "bytes untouched by install / ensure / uninstall"
+        );
+        assert_eq!(
+            tp::TP_COMMITS.load(std::sync::atomic::Ordering::SeqCst),
+            commits
+        );
+        assert!(tp::list_backups(&sb.cfg).is_empty());
+        assert_eq!(sl::injected_claude_settings_path(), None);
+
+        let sentence = sl::claude_inspection()
+            .unparseable_sentence()
+            .expect("sentence");
+        assert!(
+            sentence.contains("is not valid JSON at line "),
+            "{sentence}"
+        );
+        assert!(
+            sentence.contains("fix the file by hand") && !sentence.contains("--strip-ours"),
+            "JSON repair is never a text strip: {sentence}"
+        );
+        let rows = crate::commands_account::status_integrations(true);
+        let hook_row = rows.iter().find(|r| r["id"] == "shell-hook").unwrap();
+        assert_eq!(hook_row["detail"].as_str(), Some(sentence.as_str()));
+        assert!(unreadable_provider_configs()
+            .iter()
+            .any(|(n, _, s)| *n == "claude" && *s == sentence));
+
+        // repair: --strip-ours is not a thing for JSON; --from-backup has nothing.
+        let r = tp::repair(&ClaudeSurface, tp::RepairMode::StripOurs, true);
+        assert_eq!(
+            r.outcome.as_ref().unwrap().reason_code,
+            Some(tp::ReasonCode::TpNotApplicable)
+        );
+        let r = tp::repair(&ClaudeSurface, tp::RepairMode::FromBackup(None), true);
+        assert_eq!(
+            r.outcome.as_ref().unwrap().reason_code,
+            Some(tp::ReasonCode::TpNoBackup)
+        );
+        assert_eq!(std::fs::read(&sb.cfg).unwrap(), before);
+    }
+
+    #[test]
+    fn claude_bom_round_trips_force_backs_up_and_uninstall_keeps_user_keys() {
+        let pre = "\u{feff}{\n  \"statusLine\": { \"type\": \"command\", \"command\": \"/usr/local/bin/starship status\" },\n  \"theme\": \"dark\"\n}";
+        let sb = Sandbox::with_claude(Some(pre));
+        let before = std::fs::read(&sb.cfg).unwrap();
+
+        // foreign slot: refused without --force, bytes untouched, nothing logged as a refusal
+        assert_eq!(
+            sl::install_claude(false).unwrap(),
+            InstallOutcome::SkippedExisting
+        );
+        sl::ensure().unwrap();
+        assert_eq!(std::fs::read(&sb.cfg).unwrap(), before);
+        assert!(matches!(
+            sl::claude_inspection().detection.state,
+            tp::TpConfigState::Foreign { .. }
+        ));
+
+        // --force: takes the slot, keeps the BOM and the user's keys, backs up the pre-image
+        assert_eq!(sl::install_claude(true).unwrap(), InstallOutcome::Installed);
+        let after = std::fs::read_to_string(&sb.cfg).unwrap();
+        assert!(after.starts_with('\u{feff}'), "BOM preserved: {after:?}");
+        let v = tp::parse_json_strict(&after).unwrap();
+        assert!(sl::statusline_command_is_ours(
+            v["statusLine"]["command"].as_str().unwrap()
+        ));
+        assert_eq!(v["theme"], "dark");
+        let backups = tp::list_backups(&sb.cfg);
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert_eq!(
+            std::fs::read(&backups[0]).unwrap(),
+            before,
+            "backup is the pre-image, BOM and all"
+        );
+        assert_eq!(
+            sl::injected_claude_settings_path().as_deref(),
+            Some(sb.cfg.as_path())
+        );
+        assert_eq!(
+            sl::install_claude(true).unwrap(),
+            InstallOutcome::AlreadyInstalled,
+            "idempotent"
+        );
+        assert!(
+            !sb.cfg.with_file_name("settings.aikey_backup.json").exists(),
+            "the single-slot backup is never written any more"
+        );
+
+        // uninstall: only statusLine goes, theme stays; the pre-image backup
+        // stays AND a second versioned backup (the pre-uninstall state) appears
+        let pre_image_backup = backups[0].clone();
+        sl::uninstall_claude(false).unwrap();
+        let after = std::fs::read_to_string(&sb.cfg).unwrap();
+        let v = tp::parse_json_strict(&after).unwrap();
+        assert!(
+            v.get("statusLine").is_none() && v["theme"] == "dark",
+            "{after}"
+        );
+        assert!(after.starts_with('\u{feff}'));
+        assert!(
+            pre_image_backup.exists(),
+            "uninstall never consumes a backup"
+        );
+        assert_eq!(
+            tp::list_backups(&sb.cfg).len(),
+            2,
+            "every write leaves its own backup"
+        );
+
+        // explicit restore of the ORIGINAL brings starship back (copy, backup kept);
+        // `--from-backup` with no path would pick the newest, i.e. the pre-uninstall state.
+        let r = tp::repair(
+            &ClaudeSurface,
+            tp::RepairMode::FromBackup(Some(pre_image_backup.clone())),
+            true,
+        );
+        assert_eq!(
+            r.outcome.as_ref().unwrap().action,
+            tp::TpAction::Restored,
+            "{:?}",
+            r.outcome
+        );
+        assert_eq!(std::fs::read(&sb.cfg).unwrap(), before);
+        assert!(pre_image_backup.exists());
+    }
+
+    #[test]
+    fn claude_settings_created_from_nothing_and_deleted_when_only_ours_remains() {
+        let sb = Sandbox::with_claude(None);
+        assert_eq!(
+            sl::install_claude(false).unwrap(),
+            InstallOutcome::Installed
+        );
+        assert!(sb.cfg.exists());
+        assert!(
+            tp::list_backups(&sb.cfg).is_empty(),
+            "nothing existed to back up"
+        );
+        sl::uninstall_claude(false).unwrap();
+        assert!(!sb.cfg.exists(), "a file that held only our key is removed");
+        // and a missing ~/.claude is never conjured
+        std::fs::remove_dir_all(sb.cfg.parent().unwrap()).unwrap();
+        assert_eq!(
+            sl::install_claude(false).unwrap(),
+            InstallOutcome::NotApplicable
+        );
+        assert!(!sb.cfg.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn claude_detection_lockstep_with_remove() {
+        use tp::Surface as _;
+        let ours = format!(
+            "{{\"statusLine\":{{\"type\":\"command\",\"command\":\"{}\"}},\"theme\":\"dark\"}}",
+            sl::aikey_statusline_command()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+        );
+        for (name, text) in [
+            ("ours", ours.clone()),
+            ("ours_bom", format!("\u{feff}{ours}")),
+            (
+                "foreign",
+                "{\"statusLine\":{\"type\":\"command\",\"command\":\"starship status\"}}"
+                    .to_string(),
+            ),
+            ("none", "{\"theme\":\"dark\"}".to_string()),
+            ("empty", String::new()),
+            ("whitespace", "  \n".to_string()),
+            ("broken", "{\"statusLine\":".to_string()),
+            ("not_object", "[1,2]".to_string()),
+        ] {
+            let detected = ClaudeSurface
+                .load(&text)
+                .map(|d| ClaudeSurface.detect(&d).state.has_ours())
+                .unwrap_or(false);
+            let changed = ClaudeSurface
+                .load(&text)
+                .map(|d| {
+                    ClaudeSurface.render(&ClaudeSurface.remove(d.clone()))
+                        != ClaudeSurface.render(&d)
+                })
+                .unwrap_or(false);
+            assert_eq!(
+                detected, changed,
+                "{name}: detect={detected} remove-changes={changed}"
+            );
+        }
+    }
+
+    #[test]
+    fn healthy_file_gets_a_versioned_backup_and_unuse_strips_only_ours() {
+        let user_only = "model_provider = \"pingtoken\"\n\n[model_providers.pingtoken]\nname = \"PingToken\"\nenv_key = \"PINGTOKEN_API_KEY\"\n";
+        let sb = Sandbox::with(user_only);
+        let out = tp::apply(
+            &CodexSurface,
+            tp::TpOp::Merge(CodexInput::Scaffold {
+                base_url: "http://127.0.0.1:27200/openai".into(),
+            }),
+        );
+        assert_eq!(out.action, tp::TpAction::Merged, "{:?}", out);
+        let backup = out
+            .backup_path
+            .expect("backup before the first byte changes");
+        assert!(backup.exists());
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), user_only);
+        let after_use = std::fs::read_to_string(&sb.cfg).unwrap();
+        assert!(after_use.contains("[model_providers.aikey]"));
+        assert!(
+            after_use.contains("model_provider = \"pingtoken\""),
+            "foreign lever untouched"
+        );
+
+        let out = tp::apply(&CodexSurface, tp::TpOp::Remove);
+        assert_eq!(out.action, tp::TpAction::Removed, "{:?}", out);
+        let after_unuse = std::fs::read_to_string(&sb.cfg).unwrap();
+        assert!(!after_unuse.contains("aikey"), "{after_unuse}");
+        assert!(
+            after_unuse.contains("[model_providers.pingtoken]"),
+            "user table survives"
+        );
+        assert!(backup.exists(), "backups are never consumed by unuse");
+        assert!(sb.cfg.exists());
     }
 }

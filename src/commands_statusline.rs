@@ -16,6 +16,7 @@
 //!   - hard cap <20ms via scan budget (see usage_wal::ScanOptions)
 //!   - zero side effects on the vault / proxy
 
+use crate::commands_account::third_party_config as tp;
 use serde::Deserialize;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -1341,97 +1342,78 @@ fn install_inner(force: bool, quiet: bool) -> io::Result<InstallOutcome> {
         return Ok(InstallOutcome::NotApplicable);
     }
 
-    let current = match read_settings(&settings_path) {
-        Ok(v) => v,
-        Err(ReadError::Malformed(e)) => {
-            // Malformed settings is always user-actionable — print regardless.
-            eprintln!(
-                "  {} {}",
-                crate::symbols::CROSS.s().red(),
-                format!("Cannot parse {}: {}", settings_path.display(), e).red()
-            );
-            eprintln!(
-                "  {}",
-                "Fix or remove the file and re-run `aikey statusline install`.".dimmed()
-            );
-            return Ok(InstallOutcome::RefusedMalformed);
-        }
-        Err(ReadError::NotFound) => serde_json::json!({}),
-        Err(ReadError::Io(e)) => return Err(e),
-    };
-
     let aikey_cmd = aikey_statusline_command();
-    let existing = current
-        .as_object()
-        .and_then(|o| o.get("statusLine"))
-        .and_then(|sl| sl.as_object());
-    let existing_cmd = existing
-        .and_then(|sl| sl.get("command"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
-
-    if existing_cmd.contains("aikey statusline") {
-        // Already ours — idempotent. Quiet mode skips the chatter entirely
-        // so `aikey use` / `aikey auth login claude` don't dump this line
-        // on every invocation after the initial setup.
-        if !quiet {
-            eprintln!(
-                "  {} {}",
-                crate::symbols::CHECK.s().green(),
-                "Claude Code status line already points to aikey.".dimmed()
+    let insp = claude_inspection();
+    if let tp::TpConfigState::Foreign { owner } = &insp.detection.state {
+        if !force {
+            // User-actionable conflict — always print. Silencing this would
+            // leave the user wondering why their existing statusLine survived.
+            // Kept OUT of the guard on purpose: a foreign statusLine is a
+            // legitimate state, not a refusal worth a WARN event per `use`.
+            let rows = vec![
+                format!("File:     {}", settings_path.display()),
+                format!("Existing: {}", owner.dimmed()),
+                format!("aikey will {}", "not overwrite".yellow()),
+                String::new(),
+                "To install anyway:  aikey statusline install --force".to_string(),
+                "(the existing file will be backed up first)".to_string(),
+            ];
+            crate::ui_frame::eprint_box(
+                crate::symbols::QUESTION.s(),
+                "Claude Code statusLine already configured",
+                &rows,
             );
+            return Ok(InstallOutcome::SkippedExisting);
         }
-        return Ok(InstallOutcome::AlreadyInstalled);
     }
 
-    if !existing_cmd.is_empty() && !force {
-        // User-actionable conflict — always print. Silencing this would
-        // leave the user wondering why their existing statusLine survived.
-        let rows = vec![
-            format!("File:     {}", settings_path.display()),
-            format!("Existing: {}", existing_cmd.dimmed()),
-            format!("aikey will {}", "not overwrite".yellow()),
-            String::new(),
-            format!("To install anyway:  aikey statusline install --force"),
-            format!("(the existing value will be backed up)"),
-        ];
-        crate::ui_frame::eprint_box(
-            crate::symbols::QUESTION.s(),
-            "Claude Code statusLine already configured",
-            &rows,
-        );
-        return Ok(InstallOutcome::SkippedExisting);
+    // Everything else goes through the guard: strict parse (BOM kept),
+    // versioned backup before the first byte changes, verify, one atomic
+    // write. An unparseable file is refused with the sentence that names the
+    // line and the repair (`hook repair claude --from-backup`).
+    let out = tp::apply(
+        &ClaudeSurface,
+        tp::TpOp::Merge(ClaudeInput {
+            command: aikey_cmd.clone(),
+            force,
+        }),
+    );
+    match out.action {
+        tp::TpAction::Created | tp::TpAction::Merged => {
+            if !quiet {
+                eprintln!(
+                    "  {} Claude Code status line installed.",
+                    crate::symbols::CHECK.s().green()
+                );
+                eprintln!("    {} {}", "file:".dimmed(), settings_path.display());
+                eprintln!("    {} {}", "command:".dimmed(), aikey_cmd);
+            }
+            Ok(InstallOutcome::Installed)
+        }
+        tp::TpAction::Unchanged => {
+            // Already ours — idempotent. Quiet mode skips the chatter entirely
+            // so `aikey use` / `aikey auth login claude` don't dump this line
+            // on every invocation after the initial setup.
+            if !quiet {
+                eprintln!(
+                    "  {} {}",
+                    crate::symbols::CHECK.s().green(),
+                    "Claude Code status line already points to aikey.".dimmed()
+                );
+            }
+            Ok(InstallOutcome::AlreadyInstalled)
+        }
+        tp::TpAction::Refused => match out.reason_code {
+            Some(tp::ReasonCode::TpConfigForeign) => Ok(InstallOutcome::SkippedExisting),
+            // Sentence already printed by the guard (always — malformed is
+            // user-actionable regardless of `quiet`).
+            _ => Ok(InstallOutcome::RefusedMalformed),
+        },
+        _ => Err(io::Error::other(
+            out.sentence
+                .unwrap_or_else(|| "could not write settings.json".into()),
+        )),
     }
-
-    // Back up existing settings (even empty-file case — helps uninstall know
-    // whether the file existed before we wrote to it).
-    backup_settings(&settings_path)?;
-
-    // Merge: keep whatever else is in settings.json, set statusLine.
-    let mut merged = match &current {
-        serde_json::Value::Object(_) => current.clone(),
-        _ => serde_json::json!({}),
-    };
-    if let Some(obj) = merged.as_object_mut() {
-        obj.insert(
-            "statusLine".into(),
-            serde_json::json!({
-                "type": "command",
-                "command": aikey_cmd,
-            }),
-        );
-    }
-
-    write_settings_atomic(&settings_path, &merged)?;
-    if !quiet {
-        eprintln!(
-            "  {} Claude Code status line installed.",
-            crate::symbols::CHECK.s().green()
-        );
-        eprintln!("    {} {}", "file:".dimmed(), settings_path.display());
-        eprintln!("    {} {}", "command:".dimmed(), aikey_cmd);
-    }
-    Ok(InstallOutcome::Installed)
 }
 
 /// Idempotent auto-install called from `aikey auth login claude` / `aikey use`
@@ -1457,17 +1439,15 @@ pub fn ensure_claude_statusline_installed() {
 /// reported path matches whichever Claude persona the user's shell is
 /// currently pointing at.
 pub fn injected_claude_settings_path() -> Option<PathBuf> {
-    let settings = claude_settings_path()?;
-    let parsed = read_settings(&settings).ok()?;
-    let cmd = parsed
-        .get("statusLine")
-        .and_then(|sl| sl.get("command"))
-        .and_then(|c| c.as_str())?;
-    if cmd.contains("aikey statusline") {
-        Some(settings)
-    } else {
-        None
-    }
+    let insp = claude_inspection();
+    (insp.detection.state == tp::TpConfigState::OursActive).then_some(insp.path)
+}
+
+/// The guard's read of the active `settings.json` (honours `CLAUDE_CONFIG_DIR`).
+/// Single read for status, `aikey env`, the shell-hook row `detail` and
+/// `hook repair claude`.
+pub fn claude_inspection() -> tp::Inspection {
+    tp::inspect(&ClaudeSurface)
 }
 
 /// `aikey statusline ensure` — non-interactive auto-install invoked by the
@@ -1505,44 +1485,22 @@ pub fn ensure() -> io::Result<()> {
     if !claude_dir.exists() {
         return Ok(());
     }
-    let current = match read_settings(&settings_path) {
-        Ok(v) => v,
-        Err(ReadError::NotFound) => serde_json::json!({}),
-        // Malformed or IO error: bail silently. Wrapper context cannot
-        // surface a useful message — user discovers via `statusline status`.
-        Err(ReadError::Malformed(_)) | Err(ReadError::Io(_)) => return Ok(()),
-    };
-    let existing_cmd = current
-        .as_object()
-        .and_then(|o| o.get("statusLine"))
-        .and_then(|sl| sl.as_object())
-        .and_then(|sl| sl.get("command"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
-    if existing_cmd.contains("aikey statusline") {
-        return Ok(());
+    // Only the two states where writing is both allowed and silent: no file
+    // yet, or a file without a statusLine. Everything else (ours already,
+    // another tool's, unreadable) is a no-op HERE — the wrapper runs on every
+    // `claude` launch and must never print; `aikey statusline status` and the
+    // shell-hook row `detail` are the visibility channels.
+    match claude_inspection().detection.state {
+        tp::TpConfigState::Missing | tp::TpConfigState::PresentNoAikey => {}
+        _ => return Ok(()),
     }
-    if !existing_cmd.is_empty() {
-        // Other-tool statusLine occupies the slot — silent skip.
-        return Ok(());
-    }
-    // Empty / missing: merge-write. Back up first so a future `uninstall`
-    // can restore the pre-aikey state (even if that state was "no file").
-    backup_settings(&settings_path)?;
-    let mut merged = match &current {
-        serde_json::Value::Object(_) => current.clone(),
-        _ => serde_json::json!({}),
-    };
-    if let Some(obj) = merged.as_object_mut() {
-        obj.insert(
-            "statusLine".into(),
-            serde_json::json!({
-                "type": "command",
-                "command": aikey_statusline_command(),
-            }),
-        );
-    }
-    write_settings_atomic(&settings_path, &merged)?;
+    let _ = tp::apply(
+        &ClaudeSurface,
+        tp::TpOp::Merge(ClaudeInput {
+            command: aikey_statusline_command(),
+            force: false,
+        }),
+    );
     Ok(())
 }
 
@@ -1577,13 +1535,18 @@ pub fn uninstall_kimi() -> io::Result<()> {
     match uninstall_kimi_hook() {
         KimiUninstallOutcome::Removed => {
             eprintln!(
-                "  {} Removed aikey-managed region from ~/.kimi/config.toml.",
+                "  {} Removed aikey's Stop hook from ~/.kimi/config.toml.",
                 crate::symbols::CHECK.s().green()
             );
+            // 2026-09-05: only our hook goes; everything else in the file —
+            // including edits made after aikey's first touch — stays.
             eprintln!(
                 "    {}",
-                "Note: this also resets the Kimi provider to its pre-aikey state.".dimmed()
+                "Only the aikey hook was removed; the rest of the file is untouched.".dimmed()
             );
+        }
+        KimiUninstallOutcome::ConfigInvalid(sentence) => {
+            eprintln!("  {} {sentence}", "!".yellow());
         }
         KimiUninstallOutcome::NothingToRemove => {
             eprintln!(
@@ -1613,10 +1576,9 @@ pub fn uninstall_claude(quiet: bool) -> io::Result<()> {
         }
         return Ok(());
     };
-
-    let current = match read_settings(&settings_path) {
-        Ok(v) => v,
-        Err(ReadError::NotFound) => {
+    let insp = claude_inspection();
+    match &insp.detection.state {
+        tp::TpConfigState::Missing => {
             if !quiet {
                 eprintln!(
                     "  {}",
@@ -1625,76 +1587,62 @@ pub fn uninstall_claude(quiet: bool) -> io::Result<()> {
             }
             return Ok(());
         }
-        Err(ReadError::Malformed(e)) => {
+        tp::TpConfigState::Unparseable { .. } => {
+            // Refused by the guard: the sentence names the line and the repair.
+            // Printed here (not via apply) so a quiet caller stays quiet — the
+            // lifecycle tail runs this on every non-anthropic `use`.
+            if !quiet {
+                if let Some(sentence) = insp.unparseable_sentence() {
+                    eprintln!("  {} {sentence}", "!".yellow());
+                }
+            }
+            return Ok(());
+        }
+        st if !st.has_ours() => {
             if !quiet {
                 eprintln!(
-                    "  {} {}",
-                    crate::symbols::CROSS.s().red(),
-                    format!("Cannot parse settings.json: {}", e).red()
+                    "  {}",
+                    "Claude Code status line is not configured for aikey — nothing to remove."
+                        .dimmed()
                 );
             }
             return Ok(());
         }
-        Err(ReadError::Io(e)) => return Err(e),
-    };
-
-    let points_to_us = current
-        .get("statusLine")
-        .and_then(|sl| sl.get("command"))
-        .and_then(|c| c.as_str())
-        .map(|c| c.contains("aikey statusline"))
-        .unwrap_or(false);
-
-    if !points_to_us {
-        if !quiet {
-            eprintln!(
-                "  {}",
-                "Claude Code status line is not configured for aikey — nothing to remove.".dimmed()
-            );
-        }
-        return Ok(());
+        _ => {}
     }
 
-    // Prefer restoring the backup we wrote at install time — it reflects the
-    // exact state the user had before we touched the file.
-    let backup_path = statusline_backup_path(&settings_path);
-    if backup_path.exists() {
-        std::fs::rename(&backup_path, &settings_path)?;
-        if !quiet {
-            eprintln!(
-                "  {} Restored {} from backup.",
-                crate::symbols::CHECK.s().green(),
-                settings_path.display()
-            );
+    // 🔴 Reversed 2026-09-05 (third-party-config-guard Phase 3): this used to
+    // rename `settings.aikey_backup.json` over the file — overwriting every
+    // edit the user made after aikey's first touch (permissions, theme…). Now
+    // the structural remove drops only `statusLine`; a file that then holds
+    // nothing is deleted (we created it); backups are never consumed —
+    // `hook repair claude --from-backup` is the explicit way to use one.
+    let out = tp::apply(&ClaudeSurface, tp::TpOp::Remove);
+    match out.action {
+        tp::TpAction::Deleted => {
+            if !quiet {
+                eprintln!(
+                    "  {} Removed {} (file was otherwise empty).",
+                    crate::symbols::CHECK.s().green(),
+                    settings_path.display()
+                );
+            }
         }
-        return Ok(());
-    }
-
-    // No backup (e.g. we created the settings.json from scratch): just drop
-    // the statusLine key, leave the rest alone.
-    let mut next = current.clone();
-    if let Some(obj) = next.as_object_mut() {
-        obj.remove("statusLine");
-    }
-    // If nothing else remains, remove the file entirely rather than leave an
-    // empty `{}` that looks like user-configured state.
-    if next.as_object().map(|o| o.is_empty()).unwrap_or(false) {
-        std::fs::remove_file(&settings_path)?;
-        if !quiet {
-            eprintln!(
-                "  {} Removed {} (file was otherwise empty).",
-                crate::symbols::CHECK.s().green(),
-                settings_path.display()
-            );
+        tp::TpAction::Removed => {
+            if !quiet {
+                eprintln!(
+                    "  {} Removed aikey statusLine from {}.",
+                    crate::symbols::CHECK.s().green(),
+                    settings_path.display()
+                );
+            }
         }
-    } else {
-        write_settings_atomic(&settings_path, &next)?;
-        if !quiet {
-            eprintln!(
-                "  {} Removed aikey statusLine from {}.",
-                crate::symbols::CHECK.s().green(),
-                settings_path.display()
-            );
+        tp::TpAction::Unchanged | tp::TpAction::Refused => {}
+        _ => {
+            return Err(io::Error::other(
+                out.sentence
+                    .unwrap_or_else(|| "could not write settings.json".into()),
+            ))
         }
     }
     Ok(())
@@ -1718,21 +1666,21 @@ fn print_status_claude() -> io::Result<()> {
     let settings_path = config_dir.join("settings.json");
 
     let exists = settings_path.exists();
-    let parsed = match read_settings(&settings_path) {
-        Ok(v) => Some(v),
-        Err(ReadError::NotFound) => None,
-        Err(ReadError::Malformed(e)) => {
-            println!("  {}", format!("settings.json cannot be parsed: {e}").red());
-            return Ok(());
-        }
-        Err(ReadError::Io(e)) => return Err(e),
+    let insp = claude_inspection();
+    if let Some(sentence) = insp.unparseable_sentence() {
+        println!("  {}", sentence.red());
+        return Ok(());
+    }
+    // Keyed on the guard's STATE, never on a substring of the command: the
+    // old `contains("aikey statusline")` arm reported Windows'
+    // `aikey.exe statusline` as "other" (winpc2, 2026-09-05).
+    let ours = insp.detection.state == tp::TpConfigState::OursActive;
+    let owner: Option<String> = match &insp.detection.state {
+        tp::TpConfigState::OursActive => Some(aikey_statusline_command()),
+        tp::TpConfigState::Foreign { owner } => Some(owner.clone()),
+        _ => None,
     };
-
-    let cmd = parsed
-        .as_ref()
-        .and_then(|v| v.get("statusLine"))
-        .and_then(|sl| sl.get("command"))
-        .and_then(|c| c.as_str());
+    let cmd = owner.as_deref();
 
     let source_tag = match source {
         ConfigDirSource::EnvVar => "from CLAUDE_CONFIG_DIR".to_string(),
@@ -1763,7 +1711,7 @@ fn print_status_claude() -> io::Result<()> {
                 );
             }
         }
-        Some(c) if c.contains("aikey statusline") => {
+        Some(c) if ours => {
             println!(
                 "  {}: {}",
                 "statusLine".dimmed(),
@@ -1792,8 +1740,7 @@ fn print_status_claude() -> io::Result<()> {
             );
         }
     }
-    let backup = statusline_backup_path(&settings_path);
-    if backup.exists() {
+    if let Some(backup) = insp.backups.first() {
         println!("  {}: {}", "backup".dimmed(), backup.display());
     }
     Ok(())
@@ -1834,10 +1781,7 @@ fn print_status_kimi() {
                 .yellow()
         ),
     }
-    let backup = crate::commands_account::resolve_user_home()
-        .join(".kimi")
-        .join("config.aikey_backup.toml");
-    if backup.exists() {
+    if let Some(backup) = crate::commands_account::kimi_inspection().backups.first() {
         println!("  {}: {}", "backup".dimmed(), backup.display());
     }
 }
@@ -1884,63 +1828,136 @@ fn claude_config_dir_with_source() -> (PathBuf, ConfigDirSource) {
     )
 }
 
-/// Backup path: `<dir>/settings.aikey_backup.json`.  The backup is always a
-/// literal byte-for-byte copy of the settings file at the moment of install,
-/// so `uninstall` can restore arbitrary user-written JSON without needing
-/// to preserve formatting.
-fn statusline_backup_path(settings_path: &Path) -> PathBuf {
-    settings_path.with_file_name("settings.aikey_backup.json")
+// ---------------------------------------------------------------------------
+// Claude Code `settings.json` on the third-party config guard (Phase 3,
+// 2026-09-05). spec: R-third-party-config-guard-8 claude settings 面经守卫
+// ---------------------------------------------------------------------------
+
+pub struct ClaudeInput {
+    pub command: String,
+    /// `aikey statusline install --force`: take over a statusLine another
+    /// tool owns. The guard still backs the file up first.
+    pub force: bool,
 }
 
-#[derive(Debug)]
-enum ReadError {
-    NotFound,
-    Malformed(serde_json::Error),
-    Io(io::Error),
+pub struct ClaudeSurface;
+
+/// Ownership of a statusLine command. `aikey statusline` is what every real
+/// install writes; the second arm keeps a differently named aikey binary
+/// (test builds, a renamed executable) recognisable without ever matching a
+/// third party's `starship status` / `ccusage statusline`-style commands
+/// that carry no "aikey" at all.
+pub(crate) fn statusline_command_is_ours(c: &str) -> bool {
+    c.contains("aikey statusline") || (c.ends_with(" statusline") && c.contains("aikey"))
 }
 
-fn read_settings(path: &Path) -> Result<serde_json::Value, ReadError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(ReadError::NotFound),
-        Err(e) => return Err(ReadError::Io(e)),
-    };
-    if bytes.iter().all(|b| b.is_ascii_whitespace()) {
-        return Ok(serde_json::json!({}));
+fn statusline_command_of(doc: &serde_json::Value) -> Option<&str> {
+    doc.get("statusLine")
+        .and_then(|sl| sl.get("command"))
+        .and_then(|c| c.as_str())
+        .filter(|c| !c.is_empty())
+}
+
+impl tp::Surface for ClaudeSurface {
+    type Doc = serde_json::Value;
+    type Input = ClaudeInput;
+
+    const ID: tp::SurfaceId = tp::SurfaceId::Claude;
+    const FORMAT: tp::Format = tp::Format::Json;
+    // Never conjure ~/.claude on a machine without Claude Code; a missing
+    // settings.json inside an existing dir is fine to create.
+    const CREATE: tp::CreatePolicy = tp::CreatePolicy::RequireParentDir;
+    // The statusLine slot is exclusive. Refused unless `--force` (see
+    // `refuse_merge`); never deletes the user's file.
+    const FOREIGN: tp::ForeignPolicy = tp::ForeignPolicy::ClaimWithConsent;
+    // JSON: there is no line-level "ours" to strip; repair = --from-backup.
+    const OWNED_GRAMMAR: Option<&'static tp::OwnedTomlGrammar> = None;
+
+    fn path(&self) -> PathBuf {
+        claude_settings_path().unwrap_or_else(|| PathBuf::from("settings.json"))
     }
-    serde_json::from_slice(&bytes).map_err(ReadError::Malformed)
-}
-
-/// Backup the current settings.json verbatim when it exists.  Skips silently
-/// if there's nothing to back up, or if a previous backup is already present
-/// (we never overwrite — the first backup is the canonical "original state").
-fn backup_settings(settings_path: &Path) -> io::Result<()> {
-    if !settings_path.exists() {
-        return Ok(());
+    fn load(&self, text: &str) -> Result<Self::Doc, tp::ParseFailure> {
+        // A whitespace-only file has always meant "no settings" here.
+        if text.trim().is_empty() {
+            return Ok(serde_json::json!({}));
+        }
+        let v = tp::parse_json_strict(text)?;
+        if !v.is_object() {
+            // Valid JSON but not a settings object: the old code silently
+            // replaced it with `{}` — which threw the user's content away.
+            return Err(tp::ParseFailure {
+                line: Some(1),
+                col: Some(1),
+                msg: "top level is not a JSON object".into(),
+            });
+        }
+        Ok(v)
     }
-    let backup = statusline_backup_path(settings_path);
-    if backup.exists() {
-        return Ok(());
+    fn empty_doc(&self) -> Self::Doc {
+        serde_json::json!({})
     }
-    std::fs::copy(settings_path, &backup)?;
-    Ok(())
-}
-
-/// Atomic settings write: render the JSON into a sibling tmp file then
-/// rename it into place.  Matches the pattern the proxy uses for its own
-/// snapshot files — Claude Code may be reading settings.json at any moment
-/// as it renders the status line, so we can't tolerate a half-written file.
-fn write_settings_atomic(settings_path: &Path, value: &serde_json::Value) -> io::Result<()> {
-    let parent = settings_path.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "settings path has no parent")
-    })?;
-    std::fs::create_dir_all(parent)?;
-    let tmp = parent.join(".settings.aikey.tmp");
-    let pretty = serde_json::to_vec_pretty(value)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&tmp, &pretty)?;
-    std::fs::rename(&tmp, settings_path)?;
-    Ok(())
+    fn detect(&self, doc: &Self::Doc) -> tp::Detection {
+        let state = match statusline_command_of(doc) {
+            Some(c) if statusline_command_is_ours(c) => tp::TpConfigState::OursActive,
+            Some(c) => tp::TpConfigState::Foreign {
+                owner: c.to_string(),
+            },
+            None => tp::TpConfigState::PresentNoAikey,
+        };
+        tp::Detection::of(state)
+    }
+    fn refuse_merge(
+        &self,
+        det: &tp::Detection,
+        input: &Self::Input,
+    ) -> Option<(tp::ReasonCode, tp::ReasonCtx)> {
+        match &det.state {
+            tp::TpConfigState::Foreign { owner } if !input.force => Some((
+                tp::ReasonCode::TpConfigForeign,
+                tp::ReasonCtx {
+                    surface: Some(tp::SurfaceId::Claude),
+                    path_display: tp::display_for(&self.path()),
+                    format: Some(tp::Format::Json),
+                    owner: Some(owner.clone()),
+                    ..Default::default()
+                },
+            )),
+            _ => None,
+        }
+    }
+    fn merge(&self, mut doc: Self::Doc, input: &Self::Input) -> Result<Self::Doc, String> {
+        let obj = doc
+            .as_object_mut()
+            .ok_or("settings.json is not an object")?;
+        obj.insert(
+            "statusLine".into(),
+            serde_json::json!({ "type": "command", "command": input.command }),
+        );
+        Ok(doc)
+    }
+    fn remove(&self, mut doc: Self::Doc) -> Self::Doc {
+        // ONLY our statusLine. A foreign one is the user's (or another
+        // tool's) and stays — found by the detect⇔remove lockstep fence
+        // before it shipped: the first version dropped the key unconditionally.
+        let ours = statusline_command_of(&doc).is_some_and(statusline_command_is_ours);
+        if ours {
+            if let Some(obj) = doc.as_object_mut() {
+                obj.remove("statusLine");
+            }
+        }
+        doc
+    }
+    fn render(&self, doc: &Self::Doc) -> String {
+        // An empty object renders EMPTY so the guard deletes a file that holds
+        // nothing but what we removed (it never looked like user state).
+        if doc.as_object().map(|o| o.is_empty()).unwrap_or(false) {
+            return String::new();
+        }
+        serde_json::to_string_pretty(doc).unwrap_or_default()
+    }
+    fn expected_after_merge(&self, det: &tp::Detection, _input: &Self::Input) -> bool {
+        det.state == tp::TpConfigState::OursActive
+    }
 }
 
 /// Absolute path to the current binary, quoted if it contains whitespace, or
@@ -1962,7 +1979,7 @@ pub(crate) fn aikey_bin_quoted() -> String {
 }
 
 /// Command string for Claude Code `statusLine` entry.
-fn aikey_statusline_command() -> String {
+pub(crate) fn aikey_statusline_command() -> String {
     format!("{} statusline", aikey_bin_quoted())
 }
 
@@ -2918,6 +2935,31 @@ mod tests {
             None => serde_json::json!({}),
         };
         std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+
+    /// 🔴 Found on winpc2 2026-09-05 while deploying Phase 3: the old
+    /// predicate `contains("aikey statusline")` never matched Windows'
+    /// `C:\...\aikey.exe statusline`, so aikey's OWN statusLine reported as
+    /// "other", `install` re-prompted "already configured" on every `use`,
+    /// and `uninstall` said "not configured for aikey" and left the residue.
+    #[test]
+    fn statusline_command_is_ours_recognises_every_binary_shape() {
+        for ours in [
+            "/Users/x/.aikey/bin/aikey statusline",
+            "C:\\Users\\damon\\.aikey\\bin\\aikey.exe statusline",
+            "\"C:\\Program Files\\aikey\\aikey.exe\" statusline",
+            "/tmp/target/debug/deps/aikeylabs_aikey_cli-af74 statusline",
+        ] {
+            assert!(statusline_command_is_ours(ours), "{ours}");
+        }
+        for theirs in [
+            "/usr/local/bin/starship status",
+            "ccusage statusline",
+            "aikey-lookalike status",
+            "",
+        ] {
+            assert!(!statusline_command_is_ours(theirs), "{theirs}");
+        }
     }
 
     #[test]

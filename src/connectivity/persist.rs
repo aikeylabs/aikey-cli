@@ -166,13 +166,35 @@ pub fn aggregate_test_outcome(outcome: &SuiteOutcome) -> Vec<AggregatedTestRecor
                 opt.as_ref()
                     .map(|s| s.chars().take(280).collect::<String>())
             };
-            if let Some((_, r)) = group_rows.iter().find(|(_, r)| !r.ping_ok) {
-                let _ = r;
-                record.insert("error_code".into(), json!("PROXY_UPSTREAM_UNREACHABLE"));
-                record.insert(
-                    "error_message".into(),
-                    json!("aikey-proxy could not reach the upstream provider"),
-                );
+            if let Some((t, r)) = group_rows.iter().find(|(_, r)| !r.ping_ok) {
+                // Distinguish "the proxy could not work out WHICH upstream to
+                // dial" from "the upstream is down": the first is a wiring /
+                // version problem fixed on our side, the second a network
+                // problem. Collapsing both into UNREACHABLE sent users to
+                // check their network while the proxy had refused to resolve
+                // a ref (bugfix 2026-09-05-add-key-dialog-draft-probe-sends-
+                // unresolvable-source-ref.md).
+                match r.ping_error_code.as_deref() {
+                    Some("PROBE_UPSTREAM_UNRESOLVED") => {
+                        record.insert("error_code".into(), json!("PROBE_UPSTREAM_UNRESOLVED"));
+                        record.insert(
+                            "error_message".into(),
+                            json!(format!(
+                                "aikey-proxy could not resolve the upstream address for '{}' \
+                                 (not found in its vault view); re-run `aikey use` / restart \
+                                 the proxy, or check the key's base_url",
+                                t.key_display()
+                            )),
+                        );
+                    }
+                    _ => {
+                        record.insert("error_code".into(), json!("PROXY_UPSTREAM_UNREACHABLE"));
+                        record.insert(
+                            "error_message".into(),
+                            json!("aikey-proxy could not reach the upstream provider"),
+                        );
+                    }
+                }
             } else if let Some((_, r)) = group_rows.iter().find(|(_, r)| !r.api_ok) {
                 if let Some(status) = r.api_status {
                     record.insert("error_code".into(), json!(format!("HTTP_{}", status)));
@@ -368,6 +390,7 @@ mod tests {
             base_url: "https://api.openai.com/v1".into(),
             bearer: "test".into(),
             kind,
+            subject: crate::connectivity::ProbeSubject::Stored,
             source_ref: source_ref.into(),
             display_alias: String::new(),
         }
@@ -866,5 +889,50 @@ mod tests {
             "hint must mention disabled, got: {}",
             hint
         );
+    }
+
+    /// Fence (bugfix 2026-09-05-add-key-dialog-draft-probe-sends-
+    /// unresolvable-source-ref.md, part 2): a ping refused by the proxy
+    /// because it could not RESOLVE the ref is reported as
+    /// PROBE_UPSTREAM_UNRESOLVED, not as the network-flavoured
+    /// PROXY_UPSTREAM_UNREACHABLE.
+    #[test]
+    fn ping_refusal_with_unresolved_code_is_not_reported_as_unreachable() {
+        let mut r = ConnectivityResult::default();
+        r.ping_ok = false;
+        r.ping_error_code = Some("PROBE_UPSTREAM_UNRESOLVED".into());
+        let out = aggregate_test_outcome(&outcome(vec![(
+            target("ghost", CredentialKind::PersonalApi),
+            r,
+        )]));
+        let rec = &out
+            .iter()
+            .find(|r| r.source_ref == "ghost")
+            .expect("record for ghost")
+            .last_test;
+        assert_eq!(rec.get("status").and_then(|v| v.as_str()), Some("fail"));
+        assert_eq!(
+            rec.get("error_code").and_then(|v| v.as_str()),
+            Some("PROBE_UPSTREAM_UNRESOLVED")
+        );
+        let msg = rec
+            .get("error_message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(msg.contains("ghost"), "message names the credential: {msg}");
+
+        // Plain ping failure (no code / transport error) keeps the old code.
+        let mut r2 = ConnectivityResult::default();
+        r2.ping_ok = false;
+        let out2 = aggregate_test_outcome(&outcome(vec![(
+            target("down", CredentialKind::PersonalApi),
+            r2,
+        )]));
+        let rec2 = &out2
+            .iter()
+            .find(|r| r.source_ref == "down")
+            .expect("record for down")
+            .last_test;
+        assert_eq!(rec2["error_code"], "PROXY_UPSTREAM_UNREACHABLE");
     }
 }

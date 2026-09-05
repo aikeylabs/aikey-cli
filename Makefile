@@ -82,8 +82,11 @@ test-verbose:
 ## Third-party CLI config-injection regression (kimi/codex toml_edit merge).
 ## Guards against the 2026-07-04 kimi `hooks = []` duplicate-key corruption
 ## (workflow/CI/bugfix/2026-07-04-kimi-config-hooks-duplicate-key.md): a foreign
-## key + our blind append produced invalid TOML. Covers merge/self-heal/idempotency
-## for kimi and structural upsert/conflict for codex.
+## key + our blind append produced invalid TOML. Covers merge/idempotency for
+## kimi and structural upsert/conflict for codex. Since 2026-09-05 (third-party
+## config guard, Phase 2) a corrupted file is REFUSED rather than self-healed —
+## the strict-parse + `hook repair kimi --strip-ours` path is fenced by
+## `kimi_previously_corrupted_file_is_refused_not_healed_and_repair_strips_ours`.
 test-cli-config-injection:
 	$(CARGO) test --lib 'commands_account::shell_integration::hook_tests::kimi_merge'
 	$(CARGO) test --lib 'commands_account::shell_integration::hook_tests::kimi_remove'

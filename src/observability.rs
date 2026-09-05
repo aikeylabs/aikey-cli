@@ -18,7 +18,6 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 // ── Trace context ─────────────────────────────────────────────────────────────
 
@@ -277,6 +276,15 @@ pub const EVENT_CLI_BINDING_RECONCILED: &str = "cli.binding.reconciled";
 pub const EVENT_CLI_BINDING_AUTO_ASSIGN_SKIPPED: &str =
     "cli.binding.auto_assign_skipped_unreachable";
 
+// Third-party config guard (2026-09-05): a refused or failed write/remove on
+// a codex/kimi/claude/Desktop config file. Before this the whole injection
+// funnel was invisible to current.jsonl — the winpc2 dead-end (five `aikey use`
+// runs against an unparseable ~/.codex/config.toml) left no trace except
+// stderr. Carries tool/path/state/line/col/backup in `extra` and the
+// ReasonCode as error.code.
+// spec: R-third-party-config-guard-1.S2 坏文件不阻塞 KEY 激活（但必须留痕）
+pub const EVENT_CLI_TP_CONFIG_REFUSED: &str = "cli.third_party_config.refused";
+
 // Web-driven first-run vault setup (_internal init). The session cache is
 // best-effort — a keychain can decline — and a silent decline would leave the
 // proxy asking for a password the user believes they already configured.
@@ -322,41 +330,28 @@ pub fn log_warn_event(event_name: &str, message: &str, error_code: Option<&str>)
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Returns the current time as an ISO 8601 string (RFC 3339 format).
+///
+/// 🔴 Delegates to `commands_internal::internal_log::iso_now` (2026-09-05).
+/// This file used to carry its own civil-from-days conversion that omitted the
+/// 719468-day shift from the Unix epoch to the civil era, so EVERY line in
+/// current.jsonl was stamped year 0056 — the log could not be searched by
+/// time at all (the 2026-09-04 winpc2 forensics had to key on event names).
+/// One correct implementation, fenced by `log_timestamp_year_is_current`.
 fn iso8601_now() -> String {
-    // Use SystemTime → seconds + nanos for a portable implementation without
-    // pulling in a full datetime crate.
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    let nanos = now.subsec_nanos();
-
-    // Simple UTC formatter (no DST, no time-zone offset).
-    let s = secs % 60;
-    let m = (secs / 60) % 60;
-    let h = (secs / 3600) % 24;
-    let days = secs / 86400;
-
-    // Gregorian calendar from Unix epoch (1970-01-01).
-    let (year, month, day) = days_to_ymd(days);
-
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z",
-        year, month, day, h, m, s, nanos
-    )
+    crate::commands_internal::internal_log::iso_now()
 }
 
-/// Converts days since Unix epoch to (year, month, day).
-fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
-    // 400-year Gregorian cycle = 146097 days.
-    let era = days / 146097;
-    days %= 146097;
-    let yoe = (days - days / 1460 + days / 36524 - days / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = days - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
+#[cfg(test)]
+mod timestamp_fence {
+    /// 能红: put the old `days_to_ymd` back (no +719468) and the year reads 0056.
+    #[test]
+    fn log_timestamp_year_is_current() {
+        let ts = super::iso8601_now();
+        let year: i32 = ts[..4].parse().expect("ISO-8601 year prefix");
+        assert!(
+            (2026..=2100).contains(&year),
+            "current.jsonl ts year is {year}: {ts}"
+        );
+        assert!(ts.ends_with('Z') && ts.contains('T'), "{ts}");
+    }
 }

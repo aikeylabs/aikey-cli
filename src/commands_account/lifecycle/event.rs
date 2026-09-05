@@ -106,6 +106,12 @@ pub struct LifecycleOutcome {
     /// web can pop the consent modal / restart toast (same channel pattern
     /// as `hook_file_installed`). Shared across all outcomes in a batch.
     pub desktop_switch: Option<crate::commands_account::claude_desktop::DesktopSwitch>,
+    /// 2026-09-05 — per-surface outcome of the third-party config guard for
+    /// this event's tail (codex today; kimi / claude / desktop as they move
+    /// onto the guard). Rides the vault-op envelope as `data.third_party` so
+    /// a refused injection is visible to the tray / web, not only on stderr.
+    /// spec: R-third-party-config-guard-1.S2
+    pub third_party: Vec<crate::commands_account::third_party_config::SurfaceOutcome>,
 }
 
 /// Single-event entry: equivalent to `apply_credential_lifecycle_batch(&[event])`
@@ -258,6 +264,7 @@ pub fn apply_credential_lifecycle_batch(
                 outcome.active_env_refreshed = true;
                 outcome.active_providers = active_providers.clone();
                 outcome.desktop_switch = third_party.desktop;
+                outcome.third_party = third_party.surfaces.clone();
                 outcome.hook_file_installed = hook_file_installed;
                 outcome.hook_failure_reason = hook_failure_reason;
             }

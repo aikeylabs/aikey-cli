@@ -1310,6 +1310,29 @@ pub(crate) enum HookAction {
         #[arg(long, value_name = "SHELL")]
         shell: Option<String>,
     },
+    /// Diagnose — and, with a flag, repair — a third-party config file that
+    /// aikey writes into (`codex` today; kimi / claude / claude-desktop follow).
+    /// No flag = report only. `--strip-ours` removes ONLY aikey's own keys —
+    /// the one change that can fix a file aikey's duplicate key broke.
+    /// `--from-backup` copies the newest aikey backup (or PATH) over the file.
+    /// Both take a versioned backup first and ask before changing anything.
+    Repair {
+        /// codex | kimi | claude | claude-desktop
+        #[arg(value_name = "TARGET")]
+        target: String,
+        /// Remove only what aikey wrote; never touches your own keys.
+        #[arg(long)]
+        strip_ours: bool,
+        /// Restore the newest aikey backup, or the given file.
+        #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
+        from_backup: Option<String>,
+        /// Skip the confirmation (GUI callers whose click is the consent).
+        #[arg(long)]
+        yes: bool,
+        /// Machine-readable report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove the aikey shell hook from your shell startup files.
     ///
     /// Strips the `# aikey shell hook v3 begin … end` block from EVERY shell
@@ -1653,6 +1676,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 HookAction::Status { .. } => "hook.status".to_string(),
                 HookAction::Install { .. } => "hook.install".to_string(),
                 HookAction::Reinstall { .. } => "hook.reinstall".to_string(),
+                HookAction::Repair { .. } => "hook.repair".to_string(),
                 HookAction::Uninstall { .. } => "hook.uninstall".to_string(),
             },
             Commands::Agent { action } => match action {

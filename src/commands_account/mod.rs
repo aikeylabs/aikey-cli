@@ -3074,37 +3074,69 @@ fn candidate_kind_of(t: &crate::credential_type::CredentialType) -> &'static str
 /// (state, blocked_reason). The reason uses the SAME words the write-side
 /// guard emits, deliberately: whichever layer the user meets first says the
 /// same thing (名词字典 — one sentence, two surfaces).
+/// Every `state` value `status --json.integrations[]` can carry. The tray
+/// (Go `integrationStates` + page.html `INTEGRATION_STATES`) is fenced to this
+/// exact set — an unknown state used to render as an OPERABLE switch.
+/// spec: R-third-party-config-guard-5 未知行状态在 tray 一律置灰
+pub const INTEGRATION_STATES: &[&str] = &[
+    "taken_over",
+    "not_taken_over",
+    "not_installed",
+    "detection_failed",
+    "foreign_active",
+    "config_invalid",
+];
+
 fn codex_desktop_row_state(
-    cfg_present: bool,
-    block_present: bool,
-    taken_over: bool,
-    foreign_provider: bool,
-) -> (&'static str, Option<&'static str>) {
-    if !cfg_present {
+    inspection: &crate::commands_account::third_party_config::Inspection,
+) -> (&'static str, Option<String>) {
+    use crate::commands_account::third_party_config::{CodexLever, TpConfigState};
+    let det = &inspection.detection;
+    match &det.state {
         // Codex has never run here — there is nothing to take over, and the
         // row must say so instead of offering a switch that can only error.
-        return ("not_installed", None);
+        TpConfigState::Missing => ("not_installed", None),
+        // 🔴 The file exists but cannot be parsed (2026-09-04 winpc2: a
+        // duplicate top-level `model_provider`). This used to collapse into
+        // "activate an OpenAI key first" — an instruction that could not work,
+        // because the writer refuses unparseable files. Now it is its own
+        // state, and the reason is the SAME sentence the write guard printed
+        // (file, line:col, parser message, backup, repair command). It is
+        // never null: a tray that predates this state greys the row on any
+        // non-empty blocked_reason, so the contract is backward compatible.
+        // spec: R-third-party-config-guard-1.S1
+        TpConfigState::Unparseable { .. } => (
+            "config_invalid",
+            Some(inspection.unparseable_sentence().unwrap_or_default()),
+        ),
+        _ => {
+            match &det.codex_lever {
+                Some(CodexLever::On) => ("taken_over", None),
+                // The user (or another tool) set model_provider themselves.
+                // The write guard refuses to overwrite it — restore-fidelity:
+                // our reverse path deletes the line, so overwriting would LOSE
+                // their value. Rendered inert with "managed by another tool".
+                Some(CodexLever::Foreign { .. }) => ("foreign_active", None),
+                _ => {
+                    if det.state == TpConfigState::OursActive {
+                        ("not_taken_over", None)
+                    } else {
+                        // Parses, but no aikey provider block: turning this on
+                        // would write `model_provider = "aikey"` pointing at
+                        // nothing ("Model provider aikey not found"). Same
+                        // precondition the write guard enforces, same words.
+                        (
+                            "not_taken_over",
+                            Some(
+                                crate::commands_account::third_party_config::ReasonCode::TpBlockMissing
+                                    .sentence(&Default::default()),
+                            ),
+                        )
+                    }
+                }
+            }
+        }
     }
-    if taken_over {
-        return ("taken_over", None);
-    }
-    if foreign_provider {
-        // The user (or another tool) set model_provider themselves. The write
-        // guard refuses to overwrite it — restore-fidelity: our reverse path
-        // deletes the line, so overwriting would LOSE their value. Same state
-        // Claude Desktop uses for a cc-switch-owned profile; the page renders
-        // it inert with "managed by another tool".
-        return ("foreign_active", None);
-    }
-    if !block_present {
-        // Config exists but no aikey provider block: turning this on would
-        // write `model_provider = "aikey"` pointing at nothing, and Codex
-        // fails with "Model provider aikey not found". Same precondition the
-        // write guard enforces; surfaced here so the switch is inert WITH the
-        // reason on screen rather than erroring after the click.
-        return ("not_taken_over", Some("activate an OpenAI key first"));
-    }
-    ("not_taken_over", None)
 }
 
 fn status_integrations(vault_initialized: bool) -> Vec<serde_json::Value> {
@@ -3175,7 +3207,20 @@ fn status_integrations(vault_initialized: bool) -> Vec<serde_json::Value> {
         Some(crate::commands_account::claude_desktop::DesktopState::ForeignActive) => {
             "foreign_active"
         }
+        // The normal config exists but cannot be read (Phase 4). Rendered
+        // inert with the guard sentence; used to masquerade as "not taken
+        // over". spec: R-third-party-config-guard-6.S1
+        Some(crate::commands_account::claude_desktop::DesktopState::ConfigInvalid) => {
+            "config_invalid"
+        }
         None => "not_installed",
+    };
+    let claude_desktop_invalid_reason = if claude_desktop_label == "config_invalid" {
+        crate::commands_account::claude_desktop::desktop_inspection()
+            .and_then(|i| i.unparseable_sentence())
+            .unwrap_or_else(|| "Claude Desktop's config file cannot be read".to_string())
+    } else {
+        String::new()
     };
 
     // ── 3. Codex desktop + IDE extension ────────────────────────────────────
@@ -3192,11 +3237,28 @@ fn status_integrations(vault_initialized: bool) -> Vec<serde_json::Value> {
     // Reading it here rather than through codex_content_has_aikey: that predicate
     // answers "would `unuse` strip anything", which is true for the provider block
     // alone. This switch owns exactly one line and must report exactly that line.
-    let codex_desktop_on = crate::commands_account::codex_top_level_provider_is_ours();
-    let (codex_cfg, codex_block) = crate::commands_account::codex_desktop_preconditions();
-    let codex_foreign = crate::commands_account::codex_foreign_top_level_provider().is_some();
-    let (codex_desktop_state, codex_precondition) =
-        codex_desktop_row_state(codex_cfg, codex_block, codex_desktop_on, codex_foreign);
+    // ONE read of the file through the guard: state (incl. unparseable),
+    // lever facet and backups come from the same parsed document.
+    let codex_inspection = crate::commands_account::codex_inspection();
+    let (codex_desktop_state, codex_precondition) = codex_desktop_row_state(&codex_inspection);
+    let codex_desktop_on = codex_desktop_state == "taken_over";
+    // kimi / claude settings files the guard cannot read (Phase 2/3): shown
+    // on the shell-hook row as an informational `detail` — those tools route
+    // through env, a broken file only costs the hook/statusline.
+    let shell_hook_detail = {
+        let sentences: Vec<String> = [
+            shell_integration::kimi_inspection().unparseable_sentence(),
+            crate::commands_statusline::claude_inspection().unparseable_sentence(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if sentences.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(sentences.join(" | "))
+        }
+    };
 
     vec![
         serde_json::json!({
@@ -3213,6 +3275,12 @@ fn status_integrations(vault_initialized: bool) -> Vec<serde_json::Value> {
             "state": if hook_on { "taken_over" } else { "not_taken_over" },
             "depends_on": serde_json::Value::Null,
             "blocked_reason": blocked(true),
+            // Informational, never gates the switch (2026-09-05, Phase 2):
+            // a kimi config the guard cannot read. kimi routes through env,
+            // so a broken file only costs the Stop hook — the row stays
+            // operable and the CLI sentence (with the repair command) is shown.
+            // spec: R-third-party-config-guard-7.S1
+            "detail": shell_hook_detail,
         }),
         serde_json::json!({
             "id": "claude-desktop",
@@ -3230,7 +3298,9 @@ fn status_integrations(vault_initialized: bool) -> Vec<serde_json::Value> {
             "depends_on": serde_json::Value::Null,
             // 拼因果，别让用户对着 Desktop 自己的错误页猜（拍板 2026-08-27）：
             // 还原失败 = 接管还活着但路由已死 —— 这是 Desktop 连不上的原因句。
-            "blocked_reason": if desktop_reconcile
+            "blocked_reason": if claude_desktop_label == "config_invalid" {
+                serde_json::Value::String(claude_desktop_invalid_reason.clone())
+            } else if desktop_reconcile
                 == crate::commands_account::claude_desktop::StaleReconcile::RestoreFailed
             {
                 serde_json::Value::String(
@@ -3268,14 +3338,24 @@ fn status_integrations(vault_initialized: bool) -> Vec<serde_json::Value> {
             "taken_over": codex_desktop_on,
             "state": codex_desktop_state,
             "depends_on": "shell-hook",
-            // Vault first: with no master password NO key can be activated, so
-            // the vault step is the actionable one; the missing-block reason
-            // only leads anywhere once a vault exists.
-            "blocked_reason": if !vault_initialized {
+            // 🔴 A broken file first (2026-09-05): `config_invalid` MUST carry
+            // the repair sentence whatever the vault state — the file being
+            // unparseable has nothing to do with the master password, and the
+            // tray's Repair button needs this sentence to exist. Then vault:
+            // with no master password NO key can be activated, so that step
+            // is the actionable one; the missing-block reason only leads
+            // anywhere once a vault exists. spec: R-third-party-config-guard-1.S1
+            "blocked_reason": if codex_desktop_state == "config_invalid" {
+                codex_precondition
+                    .clone()
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null)
+            } else if !vault_initialized {
                 blocked(true)
             } else {
                 codex_precondition
-                    .map(|r| serde_json::Value::String(r.to_string()))
+                    .clone()
+                    .map(serde_json::Value::String)
                     .unwrap_or(serde_json::Value::Null)
             },
         }),
@@ -4072,32 +4152,147 @@ mod status_candidates_tests {
     /// uses the write-guard's own words (one sentence, two surfaces).
     #[test]
     fn codex_desktop_row_surfaces_its_preconditions() {
+        use crate::commands_account::third_party_config::{
+            CodexLever, Detection, Inspection, SurfaceId, TpConfigState,
+        };
+        let insp = |state: TpConfigState, lever: Option<CodexLever>| Inspection {
+            surface: SurfaceId::Codex,
+            path: std::path::PathBuf::from("/tmp/x/.codex/config.toml"),
+            detection: Detection {
+                state,
+                codex_lever: lever,
+                local_baseurl_port: None,
+                kimi_hook_command: None,
+            },
+            format: crate::commands_account::third_party_config::Format::Toml,
+            backups: Vec::new(),
+        };
         assert_eq!(
-            codex_desktop_row_state(false, false, false, false),
+            codex_desktop_row_state(&insp(TpConfigState::Missing, None)),
             ("not_installed", None)
         );
-        let (state, reason) = codex_desktop_row_state(true, false, false, false);
+        let (state, reason) =
+            codex_desktop_row_state(&insp(TpConfigState::PresentNoAikey, Some(CodexLever::Off)));
         assert_eq!(state, "not_taken_over");
         assert!(
             reason.unwrap_or_default().contains("OpenAI key"),
             "the reason must tell the user the actionable next step"
         );
         assert_eq!(
-            codex_desktop_row_state(true, true, false, false),
+            codex_desktop_row_state(&insp(TpConfigState::OursActive, Some(CodexLever::Off))),
             ("not_taken_over", None)
         );
         // Reversing needs no precondition — it only removes.
         assert_eq!(
-            codex_desktop_row_state(true, true, true, false),
+            codex_desktop_row_state(&insp(TpConfigState::OursActive, Some(CodexLever::On))),
             ("taken_over", None)
         );
         // 🔴 A user-set model_provider (ollama…) renders as foreign_active —
         // the switch must be inert BEFORE the click, because turning it on
         // would overwrite a value the reverse path cannot bring back.
         assert_eq!(
-            codex_desktop_row_state(true, true, false, true),
+            codex_desktop_row_state(&insp(
+                TpConfigState::OursActive,
+                Some(CodexLever::Foreign {
+                    value: "ollama".into()
+                })
+            )),
             ("foreign_active", None)
         );
+        // 🔴 An UNPARSEABLE file is its own state and NEVER the "activate a
+        // key" dead end (2026-09-04 winpc2). The reason carries the real cause
+        // and is never null (a pre-2026-09 tray greys the row on any
+        // non-empty blocked_reason). spec: R-third-party-config-guard-1.S1
+        let (state, reason) = codex_desktop_row_state(&insp(
+            TpConfigState::Unparseable {
+                error: "duplicate key `model_provider`".into(),
+                line: Some(7),
+                col: Some(1),
+            },
+            None,
+        ));
+        assert_eq!(state, "config_invalid");
+        let reason = reason.expect("config_invalid must always carry a reason");
+        for needle in [
+            "line 7:1",
+            "duplicate key",
+            "aikey hook repair codex --strip-ours",
+        ] {
+            assert!(reason.contains(needle), "missing {needle:?} in {reason}");
+        }
+        assert!(
+            !reason.contains("OpenAI key"),
+            "the dead-end sentence must not come back: {reason}"
+        );
+        assert!(crate::commands_account::INTEGRATION_STATES.contains(&"config_invalid"));
+    }
+
+    /// 能红: put the vault check back in front of the config_invalid branch
+    /// and this row says "set a master password first" — the sentence the
+    /// 2026-09-04 winpc2 box actually showed while its file was broken.
+    /// spec: R-third-party-config-guard-1.S1
+    #[test]
+    fn config_invalid_row_carries_the_repair_sentence_even_without_a_vault() {
+        let _guard = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().expect("tmp");
+        let prev_home = std::env::var_os("HOME");
+        let prev_up = std::env::var_os("USERPROFILE");
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("USERPROFILE", tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        std::fs::write(
+            tmp.path().join(".codex").join("config.toml"),
+            "model_provider = \"aikey\"\nmodel_provider = \"aikey\"\n",
+        )
+        .unwrap();
+        let rows = status_integrations(false); // vault NOT initialised
+        match &prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match &prev_up {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+        let row = rows
+            .iter()
+            .find(|r| r["id"] == "codex-desktop")
+            .expect("codex-desktop row");
+        assert_eq!(row["state"], "config_invalid");
+        let reason = row["blocked_reason"]
+            .as_str()
+            .expect("never null for config_invalid");
+        assert!(
+            reason.contains("aikey hook repair codex --strip-ours"),
+            "{reason}"
+        );
+        assert!(!reason.contains("master password"), "{reason}");
+    }
+
+    /// Every state the projection can emit is in the published vocabulary —
+    /// the tray's copy of this list is fenced against it cross-repo.
+    #[test]
+    fn every_emitted_integration_state_is_in_the_vocabulary() {
+        for row in status_integrations(true) {
+            let st = row["state"].as_str().expect("state is a string");
+            assert!(
+                crate::commands_account::INTEGRATION_STATES.contains(&st),
+                "state {st:?} on {} is not in INTEGRATION_STATES",
+                row["id"]
+            );
+        }
+        for s in [
+            "taken_over",
+            "not_taken_over",
+            "not_installed",
+            "detection_failed",
+            "foreign_active",
+            "config_invalid",
+        ] {
+            assert!(crate::commands_account::INTEGRATION_STATES.contains(&s));
+        }
     }
 
     /// The Codex desktop row governs desktop + IDE off one config line, so it
@@ -4166,11 +4361,13 @@ mod status_candidates_tests {
             let obj = row.as_object().expect("integration row is an object");
             let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
             keys.sort_unstable();
-            // `detail` is claude-desktop-only (2026-08-27): the auto-restore
-            // notice ("restart Claude Desktop") — informational, never gates
-            // the switch (that is blocked_reason's job). Deliberately admitted
-            // through this gate; the tray relays it via Integration.Detail.
-            let expected: Vec<&str> = if row["id"] == "claude-desktop" {
+            // `detail` is informational and never gates the switch (that is
+            // blocked_reason's job): claude-desktop's auto-restore notice
+            // (2026-08-27) and, since 2026-09-05, the shell-hook row's
+            // "kimi config cannot be read" sentence. Admitted on ANY row
+            // (design DEC-third-party-config-guard-3); the tray relays it via
+            // Integration.Detail.
+            let expected: Vec<&str> = if obj.contains_key("detail") {
                 vec![
                     "blocked_reason",
                     "depends_on",
@@ -6269,6 +6466,34 @@ pub(crate) fn apply_add_core_on_conn(
 ) -> Result<AddOutcome, String> {
     let validated = validate_alias(alias)?;
     let normalized = normalize_providers(providers);
+    // Decode the pasted secret ONCE for every add path (CLI / web / import):
+    // a `newapi_channel_conn` connection string becomes key + url, and a
+    // bare-host base_url gains `/v1` for /v1-rooted providers. The stored
+    // value is the normalised one, so what the vault page shows is what the
+    // proxy dials (「展示=执行」). See `crate::credential_input`.
+    let decoded_secret = std::str::from_utf8(secret_plaintext)
+        .ok()
+        .map(crate::credential_input::decode_secret_input);
+    let secret_plaintext: &[u8] = match &decoded_secret {
+        Some(d) => d.secret.as_bytes(),
+        None => secret_plaintext,
+    };
+    let base_url_input: Option<String> = base_url
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            decoded_secret
+                .as_ref()
+                .and_then(|d| d.embedded_base_url.clone())
+        });
+    let base_url: Option<String> = base_url_input.map(|u| {
+        crate::credential_input::normalize_base_url(
+            normalized.first().map(String::as_str).unwrap_or(""),
+            &u,
+        )
+    });
+    let base_url = base_url.as_deref();
 
     // Conflict check
     let exists = conn
@@ -7098,6 +7323,10 @@ pub(crate) mod openclaw_hook;
 pub(crate) mod claude_desktop;
 #[cfg(windows)]
 mod claude_desktop_windows;
+/// Third-party config guard — the one door for reading/writing/repairing the
+/// codex/kimi/claude/Desktop config files aikey injects into.
+/// spec: R-third-party-config-guard-2 一切写盘经唯一守卫
+pub mod third_party_config;
 
 // Credential lifecycle: single funnel for all binding writes + read-only
 // state audit. See `lifecycle/mod.rs` for the design rationale (Phase 5
@@ -7617,6 +7846,10 @@ pub fn handle_key_use(
             // same wire shape as the vault-op envelope, so scripted `aikey
             // use --json` callers (E2E DS-13) can assert consent semantics.
             "desktop_switch": lifecycle.desktop_switch,
+            // 2026-09-05: what the config guard did per third-party surface
+            // (refused / merged / unchanged …) so a JSON caller sees a refused
+            // injection instead of a silent exit 0. spec: R-third-party-config-guard-1.S2
+            "third_party": lifecycle.third_party,
         }));
     } else {
         // Stage 4 (active-state cross-shell sync, 2026-04-27): the previous
@@ -8113,6 +8346,7 @@ pub fn handle_key_unuse(
     // This ensures env vars and toml regions for unbound providers are
     // removed immediately.
     let mut desktop_switch: Option<claude_desktop::DesktopSwitch> = None;
+    let mut third_party_surfaces: Vec<third_party_config::SurfaceOutcome> = Vec::new();
     if !unbound.is_empty() {
         if let Ok(refresh) = crate::profile_activation::refresh_implicit_profile_activation() {
             let proxy_port = crate::commands_proxy::proxy_port();
@@ -8127,6 +8361,7 @@ pub fn handle_key_unuse(
             // alone with no extra wiring here (阶段7 §4.1).
             let third_party = apply_third_party_cli_configs(&active_providers, proxy_port);
             desktop_switch = third_party.desktop;
+            third_party_surfaces = third_party.surfaces;
             let _ = web_install_hook_file_layer1();
         }
     }
@@ -8137,6 +8372,9 @@ pub fn handle_key_unuse(
             "unbound_providers": unbound,
             "already_unbound": already_unbound,
             "desktop_switch": desktop_switch,
+            // 2026-09-05: per-surface guard outcome (a refused strip on an
+            // unparseable file is no longer silent). spec: R-third-party-config-guard-1.S2
+            "third_party": third_party_surfaces,
         }));
     } else {
         if unbound.is_empty() && !already_unbound.is_empty() {
@@ -9627,6 +9865,97 @@ mod core_tests {
             entry.base_url.as_deref(),
             Some("https://api.example.com/v1")
         );
+    }
+
+    /// Fence (bugfix 2026-09-05-add-key-dialog-draft-probe-sends-
+    /// unresolvable-source-ref.md, part A): every add path stores the
+    /// NORMALISED base_url — bare host → `/v1` for /v1-rooted providers — and
+    /// a pasted `newapi_channel_conn` blob is split into key + url. What the
+    /// vault page shows is then exactly what the proxy dials.
+    #[test]
+    fn apply_add_core_normalizes_bare_host_base_url_for_v1_rooted_provider() {
+        let (_dir, _lock) = setup_vault();
+        let conn = storage::open_connection().expect("open");
+        let key = current_vault_key();
+        apply_add_core_on_conn(
+            &conn,
+            &key,
+            "bare-host",
+            b"sk-x",
+            &["openai".to_string()],
+            Some("https://pingtoken.ai/"),
+            OnConflict::Error,
+        )
+        .unwrap();
+        // anthropic is host-rooted: left exactly as typed.
+        apply_add_core_on_conn(
+            &conn,
+            &key,
+            "anthropic-gw",
+            b"sk-y",
+            &["anthropic".to_string()],
+            Some("https://gw.example"),
+            OnConflict::Error,
+        )
+        .unwrap();
+        let metas = storage::list_entries_with_metadata().unwrap();
+        let by = |a: &str| {
+            metas
+                .iter()
+                .find(|m| m.alias == a)
+                .unwrap()
+                .base_url
+                .clone()
+        };
+        assert_eq!(by("bare-host").as_deref(), Some("https://pingtoken.ai/v1"));
+        assert_eq!(by("anthropic-gw").as_deref(), Some("https://gw.example"));
+    }
+
+    #[test]
+    fn apply_add_core_decodes_newapi_channel_conn_paste() {
+        let (_dir, _lock) = setup_vault();
+        let conn = storage::open_connection().expect("open");
+        let key = current_vault_key();
+        let blob =
+            br#"{"_type":"newapi_channel_conn","key":"sk-inside","url":"https://pingtoken.ai"}"#;
+        apply_add_core_on_conn(
+            &conn,
+            &key,
+            "pasted",
+            blob,
+            &["openai".to_string()],
+            None,
+            OnConflict::Error,
+        )
+        .unwrap();
+        let metas = storage::list_entries_with_metadata().unwrap();
+        let entry = metas.iter().find(|m| m.alias == "pasted").unwrap();
+        assert_eq!(
+            entry.base_url.as_deref(),
+            Some("https://pingtoken.ai/v1"),
+            "embedded url is used and normalised"
+        );
+        let (nonce, ct) = storage::get_entry("pasted").expect("read back entry");
+        let secret = crate::crypto::decrypt(&key, &nonce, &ct).expect("decrypt");
+        assert_eq!(
+            &secret[..],
+            &b"sk-inside"[..],
+            "the stored secret is the key, not the JSON blob"
+        );
+        // An explicit base_url field still wins over the embedded url.
+        apply_add_core_on_conn(
+            &conn,
+            &key,
+            "pasted2",
+            blob,
+            &["openai".to_string()],
+            Some("https://other.example/v1"),
+            OnConflict::Error,
+        )
+        .unwrap();
+        let metas = storage::list_entries_with_metadata().unwrap();
+        let e2 = metas.iter().find(|m| m.alias == "pasted2").unwrap();
+        assert_eq!(e2.base_url.as_deref(), Some("https://other.example/v1"));
     }
 
     #[test]
