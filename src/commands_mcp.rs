@@ -26,7 +26,10 @@
 //!
 //! Three of the four commands never touch the vault:
 //!
-//!   list    reads the config file only
+//!   list    reads the config file, plus a best-effort GET /health/mcp so it can
+//!           say WHERE those entries are served from (2026-09-04). 🔴 Still no
+//!           vault, and still works with the proxy stopped: a failed probe falls
+//!           back to the plain endpoint line, never to an error.
 //!   remove  edits the config file only
 //!   test    asks the RUNNING PROXY (which already holds the derived key) —
 //!           the same shape as Plan D's probe, per the interaction-simplicity
@@ -361,18 +364,85 @@ where
         println!("  credential: stored as vault alias '{alias}' → ${env_name}");
     }
     println!();
-    println!("  Point your MCP client at:  {}", local_endpoint());
-    println!("  🔒 The secret stays in the vault — it is never written to your client config.");
-    println!();
+    // 🔴 The next-step text depends on whether this node will ever READ the file
+    // just written. On a machine that follows a control plane it will not, and
+    // printing the /mcp/local URL plus "run aikey mcp review" there states three
+    // things that are all false — see `render_add_next_steps`.
+    print!("{}", render_add_next_steps(policy_source().as_deref(), &local_endpoint()));
+    Ok(())
+}
+
+/// What to tell the user after a backend was written, given who owns the policy.
+///
+/// # The failure this exists to stop
+///
+/// On a node that follows a control plane, `~/.aikey/mcp.json` is not read at
+/// all ("the control plane wins by existing"). This command nevertheless
+/// reported success, printed `http://127.0.0.1:<port>/mcp/local` as the endpoint
+/// to point a client at, and told the user to run `aikey mcp review` — which
+/// answers 503 there, because reviewing is the console's job on that edition.
+/// Three statements, none of them true, on the machine where a developer is
+/// most likely to be following the quickstart.
+///
+/// 🔴 A WARNING, not a refusal. The write itself is legitimate and useful: it is
+/// recorded, it is what this machine would host if it ever stopped following a
+/// control plane, and refusing would block a user whose administrator is about
+/// to grant them the same server anyway. "不阻塞用户流程 > 错误要显眼" — so the
+/// file is written and the reason it is inert is impossible to miss.
+///
+/// 🔴 Split into a pure function so the wording is testable without a proxy,
+/// a vault or a filesystem. The bug being fenced is entirely about WHICH TEXT
+/// is printed.
+fn render_add_next_steps(policy_source: Option<&str>, endpoint: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if policy_source == Some(POLICY_SOURCE_CONTROL_PLANE) {
+        let _ = writeln!(out, "  {} {CONTROL_PLANE_HEADLINE}", crate::symbols::WARN.s());
+        let _ = writeln!(
+            out,
+            "  Your organisation's console decides which MCP servers this machine hosts, so"
+        );
+        let _ = writeln!(
+            out,
+            "  the backend you just recorded is not being served and `aikey mcp review` will"
+        );
+        let _ = writeln!(out, "  decline — reviewing happens in the console there.");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "  What to do instead:");
+        let _ = writeln!(
+            out,
+            "    • ask an administrator to add this server in the console, or"
+        );
+        let _ = writeln!(
+            out,
+            "    • run it on a machine that is not signed in to an organisation."
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "  The entry was still written — it is what this machine would host if it ever"
+        );
+        let _ = writeln!(out, "  stops following a control plane.");
+        return out;
+    }
+    let _ = writeln!(out, "  Point your MCP client at:  {endpoint}");
+    let _ = writeln!(
+        out,
+        "  🔒 The secret stays in the vault — it is never written to your client config."
+    );
+    let _ = writeln!(out);
     // 🔴 Said here rather than left to be discovered. Before P14.3 this command
     // was silent about two things at once: the gateway only reads mcp.json at
     // start-up, and a newly registered server's tools are not served until a
     // person has looked at them. Either one alone produces "I added it and
     // nothing happened", with nothing on screen to explain it.
-    println!("  Its tools are NOT available yet: nothing is served from a server nobody has");
-    println!("  looked at. Read what it offers and release it:");
-    println!("      aikey mcp review");
-    Ok(())
+    let _ = writeln!(
+        out,
+        "  Its tools are NOT available yet: nothing is served from a server nobody has"
+    );
+    let _ = writeln!(out, "  looked at. Read what it offers and release it:");
+    let _ = writeln!(out, "      aikey mcp review");
+    out
 }
 
 /// Reads a secret from stdin.
@@ -435,7 +505,9 @@ fn store_credential(
     .map(|_| ())
 }
 
-/// `aikey mcp list` — 🔴 reads the config file only. No vault, no password.
+/// `aikey mcp list` — 🔴 no vault, no password. Reads the config file, and asks
+/// the gateway (best-effort) which producer actually owns this node's toolsets
+/// so the footer cannot promise an endpoint that does not serve them.
 pub fn cmd_list(json: bool) -> Result<(), String> {
     let path = config_path();
     let cfg = load(&path)?;
@@ -472,8 +544,298 @@ pub fn cmd_list(json: bool) -> Result<(), String> {
         }
     }
     println!();
-    println!("  Endpoint: {}", local_endpoint());
+    print!(
+        "{}",
+        render_list_footer(policy_source().as_deref(), &local_endpoint())
+    );
     Ok(())
+}
+
+/// The tail of `aikey mcp list`: where these servers are actually served from.
+///
+/// bugfix: workflow/CI/bugfix/20260904-mcp-add-claimed-success-on-a-control-plane-node.md
+///
+/// 🔴 The `Endpoint:` line is a claim that pointing a client there reaches the
+/// servers listed above it. On a node that follows a control plane that is
+/// false — `~/.aikey/mcp.json` is not read, and `/mcp/local` does not serve
+/// these — so the line is REPLACED rather than annotated. A correct-looking URL
+/// underneath a warning is still the thing a user copies.
+///
+/// 🔴 `None` (gateway not running, or an older build) keeps the original line.
+/// `list` is a config-file reader that must work with no proxy at all; guessing
+/// a producer we could not read would warn on every machine whose proxy is
+/// simply stopped.
+fn render_list_footer(policy_source: Option<&str>, endpoint: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if policy_source == Some(POLICY_SOURCE_CONTROL_PLANE) {
+        let _ = writeln!(out, "  {} {CONTROL_PLANE_HEADLINE}", crate::symbols::WARN.s());
+        let _ = writeln!(
+            out,
+            "  The entries above are recorded but NOT served here; your organisation's"
+        );
+        let _ = writeln!(
+            out,
+            "  console decides what this machine hosts. They would take effect if this"
+        );
+        let _ = writeln!(out, "  machine ever stops following a control plane.");
+        return out;
+    }
+    let _ = writeln!(out, "  Endpoint: {endpoint}");
+    out
+}
+
+/// `aikey mcp calls` — this machine's own record of every MCP tool call.
+///
+/// # Why this command exists (task 5.7)
+///
+/// Every tool call is written to the proxy's local `mcp_call_event` table
+/// before it is shipped anywhere. On Production that table is an OUTBOX and the
+/// console is where people read the history. On Personal there is no control
+/// plane and no console: the table is not an outbox, it IS the audit — and
+/// until this command there was no way to read it. "Which tools did my agent
+/// run, and were any refused" was a question the product could not answer for
+/// its simplest edition, even though it had recorded the answer all along.
+///
+/// # 🔴 Read-only, and against the daemon's own file
+///
+/// Opened SQLITE_OPEN_READ_ONLY so a live proxy's WAL is never locked by
+/// somebody running this while their agent is working — the same treatment the
+/// trial-DB reader in commands_project.rs gives a running trial-server.
+///
+/// The path comes from the proxy's own config (`events.db_path`), NOT from a
+/// constant here. A CLI that resolves a different file from the daemon prints
+/// an empty history for a database that is being written to right now, and
+/// nothing about that output looks wrong.
+///
+/// # 🔴 Shapes, never values
+///
+/// The SELECT names `args_digest` and deliberately never `args_raw`. Per R24 a
+/// interface returning argument VALUES is a privileged read that has to leave a
+/// trace; one returning shapes and counts does not. Keeping this command on the
+/// shapes side is what makes it safe to run without recording who ran it —
+/// which matters most in the edition it was written for, where the reader and
+/// the subject are the same person and a trace would be pure ceremony.
+///
+/// (On Personal `args_raw` is NULL regardless: retention of raw arguments needs
+/// an organisation-level switch, and the local policy source never sets one.
+/// The SELECT still refuses to name the column, because "it happens to be empty
+/// today" is not a boundary.)
+///
+/// Fence: `calls_query_never_reads_raw_arguments`.
+pub fn cmd_calls(
+    limit: usize,
+    tool: Option<&str>,
+    failed_only: bool,
+    json: bool,
+) -> Result<(), String> {
+    use colored::Colorize;
+
+    let db_path = crate::commands_proxy::read_yaml_events_db_path(None);
+    if !db_path.exists() {
+        // 🔴 Names the path it looked at. "No records" and "I looked in the
+        // wrong place" are indistinguishable to a user otherwise, and the second
+        // one is the failure this whole path is most likely to hit.
+        if json {
+            crate::json_output::success(serde_json::json!({
+                "db_path": db_path.display().to_string(),
+                "available": false,
+                "calls": [],
+            }));
+        }
+        println!("No local call record yet.");
+        println!();
+        println!("  Looked in: {}", db_path.display());
+        println!("  The proxy creates this on its first run — start it with `aikey proxy start`.");
+        return Ok(());
+    }
+
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| format!("open {}: {e}", db_path.display()))?;
+
+    // 🔴 Probe for the table rather than letting the prepare fail. It is created
+    // lazily by the proxy's MCP plane, so "absent" means "no MCP call has ever
+    // been recorded on this machine" — a normal state with a useful answer, not
+    // an error the user can act on.
+    let has_table: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='mcp_call_event'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !has_table {
+        if json {
+            crate::json_output::success(serde_json::json!({
+                "db_path": db_path.display().to_string(),
+                "available": true,
+                "calls": [],
+            }));
+        }
+        println!("No MCP tool calls recorded on this machine yet.");
+        println!();
+        println!("  Configured servers:  aikey mcp list");
+        println!("  Are they reachable:  aikey mcp test");
+        return Ok(());
+    }
+
+    let mut sql = format!("SELECT {CALLS_COLUMNS} FROM mcp_call_event");
+    let mut where_parts: Vec<String> = Vec::new();
+    if tool.is_some() {
+        where_parts.push("tool_name = ?1".to_string());
+    }
+    if failed_only {
+        where_parts.push("status <> 'ok'".to_string());
+    }
+    if !where_parts.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_parts.join(" AND "));
+    }
+    sql.push_str(" ORDER BY created_at_ms DESC LIMIT ");
+    sql.push_str(&limit.to_string());
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare: {e}"))?;
+    let map = |row: &rusqlite::Row<'_>| -> rusqlite::Result<CallRow> {
+        Ok(CallRow {
+            created_at_ms: row.get(0)?,
+            tool_name: row.get(1)?,
+            app_slug: row.get(2)?,
+            origin: row.get(3)?,
+            status: row.get(4)?,
+            error_code: row.get(5)?,
+            duration_ms: row.get(6)?,
+            args_digest: row.get(7)?,
+            seat_id: row.get(8)?,
+        })
+    };
+    let rows: Vec<CallRow> = match tool {
+        Some(t) => stmt
+            .query_map([t], map)
+            .map_err(|e| format!("query: {e}"))?
+            .filter_map(Result::ok)
+            .collect(),
+        None => stmt
+            .query_map([], map)
+            .map_err(|e| format!("query: {e}"))?
+            .filter_map(Result::ok)
+            .collect(),
+    };
+
+    if json {
+        crate::json_output::success(serde_json::json!({
+            "db_path": db_path.display().to_string(),
+            "available": true,
+            "retention_days": crate::commands_proxy::read_yaml_retention_days(None),
+            "calls": rows.iter().map(|r| serde_json::json!({
+                "created_at_ms": r.created_at_ms,
+                "tool_name": r.tool_name,
+                "app_slug": r.app_slug,
+                "origin": r.origin,
+                "status": r.status,
+                "error_code": r.error_code,
+                "duration_ms": r.duration_ms,
+                "args_shape": r.args_digest,
+                "seat_id": r.seat_id,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+
+    if rows.is_empty() {
+        println!("No calls match that filter.");
+        return Ok(());
+    }
+
+    // 🔴 Says whose record this is. In Production the authoritative history is
+    // the console's; this file only holds what THIS machine did and only for as
+    // long as retention keeps it. A user who reads it as the organisation's
+    // audit would draw a conclusion from a window with two edges they cannot see.
+    println!(
+        "MCP tool calls on this machine (last {} days, most recent first):",
+        crate::commands_proxy::read_yaml_retention_days(None)
+    );
+    println!();
+    for r in &rows {
+        let outcome = if r.status == "ok" {
+            r.status.green().to_string()
+        } else if r.error_code.is_empty() {
+            r.status.yellow().to_string()
+        } else {
+            format!("{} ({})", r.status, r.error_code).yellow().to_string()
+        };
+        let agent = if r.app_slug.is_empty() {
+            "-".to_string()
+        } else {
+            r.app_slug.clone()
+        };
+        println!(
+            "  {}  {}  {}",
+            format_call_time(r.created_at_ms).dimmed(),
+            r.tool_name,
+            outcome
+        );
+        // 🔴 The seat is printed only when there is one. Personal has no seats,
+        // and a column of empty values teaches people to stop reading the line.
+        let seat = if r.seat_id.is_empty() {
+            String::new()
+        } else {
+            format!("  seat: {}", r.seat_id)
+        };
+        println!(
+            "    {}  agent: {}  origin: {}  took: {}ms{}",
+            format!("args {}", r.args_digest).dimmed(),
+            agent,
+            r.origin,
+            r.duration_ms,
+            seat
+        );
+    }
+    println!();
+    println!(
+        "  {}",
+        "Argument values are not recorded — only their shape.".dimmed()
+    );
+    Ok(())
+}
+
+/// The columns `aikey mcp calls` reads, and the ONLY ones it may.
+///
+/// 🔴 `args_raw` is deliberately absent, and this constant exists so that fact
+/// is assertable. Per R24, an interface that returns argument VALUES is a
+/// privileged read that must leave a trace; one that returns shapes and counts
+/// does not. Naming the column here — even to filter it later — would move this
+/// command to the wrong side of that line.
+///
+/// 🔴 A CONSTANT rather than a test that greps this file: a source scan for
+/// "args_raw" would match the test's own explanation of the rule, so the only
+/// way to make it pass would be to delete the sentence that states it.
+///
+/// Fence: `calls_never_reads_raw_arguments`.
+pub(crate) const CALLS_COLUMNS: &str = "created_at_ms, tool_name, app_slug, origin, status, \
+     error_code, duration_ms, args_digest, seat_id";
+
+struct CallRow {
+    created_at_ms: i64,
+    tool_name: String,
+    app_slug: String,
+    origin: String,
+    status: String,
+    error_code: String,
+    duration_ms: i64,
+    args_digest: String,
+    seat_id: String,
+}
+
+/// Render an epoch-millis timestamp as local time.
+fn format_call_time(ms: i64) -> String {
+    use chrono::{Local, TimeZone};
+    match Local.timestamp_millis_opt(ms) {
+        chrono::LocalResult::Single(t) => t.format("%Y-%m-%d %H:%M:%S").to_string(),
+        _ => format!("{ms}ms"),
+    }
 }
 
 /// `aikey mcp remove` — 🔴 config file only. No vault, no password.
@@ -565,7 +927,7 @@ pub fn cmd_test(name: Option<&str>, json: bool) -> Result<(), String> {
         println!("{body}");
         return Ok(());
     }
-    print!("{}", render_health(&body, name));
+    print!("{}", render_health(&body, name, cfg.backends.len()));
     Ok(())
 }
 
@@ -612,7 +974,70 @@ struct McpHealth {
     manifest_age_seconds: Option<i64>,
     #[serde(default)]
     toolset_count: Option<u64>,
+    /// Which producer owns this node's toolsets: `control_plane` or
+    /// `local_config`.
+    ///
+    /// 🔴 An Option, and `None` means "this build did not say" — NOT
+    /// `local_config`. Defaulting an absent discriminator to either value is how
+    /// a warning silently stops firing against an older proxy.
+    #[serde(default)]
+    policy_source: Option<String>,
 }
+
+/// Asks the RUNNING gateway which producer owns this node's MCP policy.
+///
+/// # Why `aikey mcp add` needs this
+///
+/// Two producers can fill the same policy snapshot, and exactly one wins on any
+/// given node: a control plane's rail, or this machine's own `mcp.json`. The
+/// rule is "the control plane wins by existing" — so on a machine that follows
+/// one, `aikey mcp add` writes a file that will never be read. It used to print
+/// a checkmark, a `/mcp/local` URL and an instruction to run `aikey mcp review`
+/// anyway, and every one of those three was false there.
+///
+/// 🔴 Asked of the proxy, never re-derived here. The decision depends on the
+/// control-panel URL AND on which managed keys resolve to an org — state the
+/// proxy already holds. A second implementation in the CLI would be a second
+/// truth to keep in step, and the day they disagree is the day this warning
+/// points the wrong way.
+///
+/// # Why a failure is silent
+///
+/// Returns `None` when the gateway is not running, answers something
+/// unparseable, or is an older build with no `policy_source`. 🔴 "I could not
+/// find out" must not print a warning about a state nobody established, and it
+/// must never block: `aikey mcp add` is a config-file edit that deliberately
+/// works with no proxy and no password.
+fn policy_source() -> Option<String> {
+    let url = format!(
+        "http://127.0.0.1:{}/health/mcp",
+        crate::commands_proxy::proxy_port()
+    );
+    let body = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(2))
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    serde_json::from_str::<McpHealth>(&body).ok()?.policy_source
+}
+
+/// The value `policy_source` carries on a node whose organisation decides.
+///
+/// 🔴 Spelled once. It is a wire value shared with
+/// `aikey-proxy/internal/mcp/health.go`'s PolicySourceControlPlane, and the
+/// HEALTH_CONTRACT_DOCUMENT fence on both sides is what keeps the two literals
+/// equal.
+const POLICY_SOURCE_CONTROL_PLANE: &str = "control_plane";
+
+/// The one sentence every command uses to say the local file is inert.
+///
+/// 🔴 Spelled ONCE and shared by `add`, `list` and `test`. Three commands
+/// describing the same machine state in three wordings is how a user ends up
+/// believing they are three different problems — the terminology rule applied to
+/// the case that actually caused it.
+const CONTROL_PLANE_HEADLINE: &str =
+    "This machine follows a control plane, so it does NOT read ~/.aikey/mcp.json.";
 
 /// Renders `/health/mcp` for a human.
 ///
@@ -620,7 +1045,14 @@ struct McpHealth {
 /// and it is fine" are different facts, and collapsing them is how a dead
 /// backend shows up green — the same three-state rule the health endpoint
 /// itself enforces.
-fn render_health(body: &str, only: Option<&str>) -> String {
+/// `local_backends` is how many servers are configured in `~/.aikey/mcp.json`.
+///
+/// 🔴 Passed in rather than read here, because the CONTRADICTION is what matters:
+/// "you have written N servers into a file this node does not read" is the
+/// sentence a user needs, and it cannot be formed from the health document
+/// alone. On a node that DOES read the file the count is irrelevant and nothing
+/// extra is printed.
+fn render_health(body: &str, only: Option<&str>, local_backends: usize) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let doc: McpHealth = match serde_json::from_str(body) {
@@ -637,8 +1069,35 @@ fn render_health(body: &str, only: Option<&str>) -> String {
         }
     };
 
+    // 🔴 The producer, stated before anything else. Without it "hosting no
+    // backends" answers a question the user did not ask: on a control-plane node
+    // the truth is not "there are none", it is "the ones you wrote are not read
+    // here". bugfix: 20260904-mcp-add-claimed-success-on-a-control-plane-node.md
+    let control_plane = doc.policy_source.as_deref() == Some(POLICY_SOURCE_CONTROL_PLANE);
+    if control_plane && local_backends > 0 {
+        let _ = writeln!(out, "{} {CONTROL_PLANE_HEADLINE}", crate::symbols::WARN.s());
+        let _ = writeln!(
+            out,
+            "  The {local_backends} server(s) in your config are NOT being served here — your"
+        );
+        let _ = writeln!(
+            out,
+            "  organisation's console decides what this machine hosts."
+        );
+        let _ = writeln!(out);
+    }
+
     if doc.backends.is_empty() {
-        if doc.toolset_count.unwrap_or(0) == 0 {
+        if control_plane {
+            // 🔴 NOT "hosting no backends". That sentence sends a user to look
+            // for a server that is missing; the actual state is that this node
+            // is served by its organisation and has nothing of its own.
+            let _ = writeln!(
+                out,
+                "This node's toolsets come from your organisation's console; it hosts no \
+                 MCP server of its own."
+            );
+        } else if doc.toolset_count.unwrap_or(0) == 0 {
             let _ = writeln!(out, "The gateway is running and hosting no backends.");
         } else {
             let _ = writeln!(
@@ -737,6 +1196,70 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
+    // 🔴 Task 5.7 — `aikey mcp calls`, the Personal edition's audit reader.
+    // -----------------------------------------------------------------------
+
+    /// The command may read argument SHAPES and never argument VALUES.
+    ///
+    /// R24 draws the line there: an interface returning values is a privileged
+    /// read that has to record who performed it; one returning shapes and counts
+    /// does not. `aikey mcp calls` is deliberately on the shapes side, which is
+    /// what makes it safe to run without a trace — and on Personal, where the
+    /// reader and the subject are the same person, a trace would be ceremony.
+    ///
+    /// 🔴 Asserts the COLUMN CONSTANT, not the source file. A grep of this file
+    /// for "args_raw" would match this very comment, so the only way to turn it
+    /// green would be to delete the sentence explaining the rule.
+    ///
+    /// 能红: add `args_raw` to CALLS_COLUMNS.
+    #[test]
+    fn calls_never_reads_raw_arguments() {
+        assert!(
+            !CALLS_COLUMNS.contains("args_raw"),
+            "`aikey mcp calls` selects raw argument values ({CALLS_COLUMNS}).\n\
+             That moves it across R24's line: returning VALUES is a privileged read that must \
+             leave a trace, and this command records none. Read the digest instead."
+        );
+        assert!(
+            CALLS_COLUMNS.contains("args_digest"),
+            "the shape column is gone, so the command shows no argument information at all — \
+             which is not the fix for the line above, it is a different regression"
+        );
+    }
+
+    /// Where the local record lives, in the CLI's words.
+    ///
+    /// 🔴 The Go half is `TestEventsDBPathDefaultIsWhereTheCLILooks` in
+    /// aikey-proxy/internal/config. Two languages, no shared schema, so the only
+    /// thing keeping them in step is a test on each side pinning the SAME
+    /// literal — exactly the arrangement ~/.aikey/mcp.json needed in task 5.6.
+    ///
+    /// 🔴 The failure mode when they drift is SILENT and that is the whole
+    /// point: nothing errors. The CLI opens a file that does not exist, prints
+    /// "no local call record yet", and the daemon goes on writing calls into the
+    /// database nobody is reading. Both halves report success.
+    ///
+    /// 能红: change either constant.
+    #[test]
+    fn events_db_path_default_matches_the_proxy() {
+        assert_eq!(
+            crate::commands_proxy::DEFAULT_EVENTS_DB_PATH,
+            "~/.aikey/data/events.db",
+            "the CLI now looks somewhere else for the proxy's events database. If this is \
+             intentional, change config.DefaultEventsDBPath in aikey-proxy/internal/config/\
+             defaults.go in the SAME commit — when these two disagree, neither side errors."
+        );
+        assert_eq!(
+            crate::commands_proxy::DEFAULT_WAL_RETENTION_DAYS,
+            30,
+            "the retention window the CLI reports no longer matches the daemon's default \
+             (config.DefaultWALRetentionDays). `aikey mcp calls` prints this number as \
+             'how far back this record goes', so a wrong one tells the user their history is \
+             longer or shorter than it is."
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // 🔴 CROSS-LANGUAGE CONTRACT with the proxy (阶段8 P14)
     //
     // The Go half is aikey-proxy/internal/mcp/health_contract_test.go, which
@@ -781,6 +1304,7 @@ mod tests {
   "call_records_dropped": 0,
   "tools_added_since_setup": 1,
   "tool_approvals_unreadable": "unexpected end of JSON input",
+  "policy_source": "control_plane",
   "review_backlog_state": "warn"
 }"#;
 
@@ -867,13 +1391,203 @@ mod tests {
         );
         assert_eq!(doc.manifest_age_seconds, Some(12));
         assert_eq!(doc.toolset_count, Some(1));
+        assert_eq!(
+            doc.policy_source.as_deref(),
+            Some(POLICY_SOURCE_CONTROL_PLANE),
+            "🔴 `policy_source` is what tells `aikey mcp add` whether the file it just \
+             wrote will ever be read. Losing it here does not fail anything loudly — the \
+             warning simply stops appearing, on exactly the nodes that need it."
+        );
+    }
+
+    /// `aikey mcp add` must say the file is inert on a control-plane node.
+    ///
+    /// bugfix: workflow/CI/bugfix/20260904-mcp-add-claimed-success-on-a-control-plane-node.md
+    ///
+    /// 🔴 Asserts the NEGATIVE too. The old text named a `/mcp/local` endpoint
+    /// and told the user to run `aikey mcp review`; on this edition the endpoint
+    /// does not serve that backend and the review command answers 503. A fence
+    /// that only checked "a warning appears" would pass while both false
+    /// instructions were still printed underneath it.
+    ///
+    /// 能红: return the same text for both policy sources.
+    #[test]
+    fn add_on_a_control_plane_node_says_the_file_is_not_read() {
+        let out = render_add_next_steps(Some(POLICY_SOURCE_CONTROL_PLANE), "http://127.0.0.1:1/mcp/local");
+        assert!(
+            out.contains("does NOT read ~/.aikey/mcp.json"),
+            "the user is not told the file is inert: {out}"
+        );
+        assert!(
+            out.contains("console"),
+            "the user is not told where the decision actually happens: {out}"
+        );
+        // 🔴 The command MAY be named — telling the user it will decline is the
+        // useful half. What must not survive is the INSTRUCTION: the lead-in
+        // plus the command on its own indented line, which is how every other
+        // "run this next" block in this CLI is written.
+        assert!(
+            !out.contains("Read what it offers and release it"),
+            "🔴 still instructs the user to release tools that are not being served: {out}"
+        );
+        assert!(
+            !out.contains("      aikey mcp review"),
+            "🔴 still prints `aikey mcp review` as a next step; it answers 503 here: {out}"
+        );
+        assert!(
+            !out.contains("/mcp/local"),
+            "🔴 still names an endpoint that does not serve this backend here: {out}"
+        );
+        assert!(
+            out.contains("was still written"),
+            "the user is not told what DID happen, so it reads as a failure: {out}"
+        );
+    }
+
+    /// The other direction — on Personal the original guidance must survive
+    /// intact, or the warning above would have been bought by breaking the
+    /// edition the feature is FOR.
+    ///
+    /// 能红: warn unconditionally.
+    #[test]
+    fn add_on_a_local_config_node_keeps_the_original_next_steps() {
+        for source in [Some("local_config"), None] {
+            let out = render_add_next_steps(source, "http://127.0.0.1:27200/mcp/local");
+            assert!(
+                out.contains("http://127.0.0.1:27200/mcp/local"),
+                "{source:?}: the endpoint to point a client at is gone: {out}"
+            );
+            assert!(
+                out.contains("aikey mcp review"),
+                "{source:?}: the first-review gate is no longer explained, so a user whose \
+                 Agent has no tools has nothing on screen telling them why: {out}"
+            );
+            assert!(
+                !out.contains("does NOT read"),
+                "🔴 {source:?}: warns on a node that DOES read the file. `None` means the \
+                 gateway did not say — warning there would fire on every machine whose \
+                 proxy is simply not running: {out}"
+            );
+        }
+    }
+
+    /// `aikey mcp test` must not answer "there are none" when the truth is
+    /// "yours are not read here".
+    ///
+    /// bugfix: workflow/CI/bugfix/20260904-mcp-add-claimed-success-on-a-control-plane-node.md
+    ///
+    /// 能红: drop the `control_plane` branch in render_health.
+    #[test]
+    fn test_on_a_control_plane_node_says_where_the_toolsets_come_from() {
+        // A control-plane node with nothing probed, and the user has written two
+        // servers locally — the exact state that produced "hosting no backends".
+        let doc = r#"{"status":"healthy","policy_source":"control_plane","backends":{}}"#;
+        let out = render_health(doc, None, 2);
+        assert!(
+            !out.contains("hosting no backends"),
+            "🔴 still answers 'there are no backends' on a node where the user's two \
+             backends are simply not read: {out}"
+        );
+        assert!(
+            out.contains("does NOT read ~/.aikey/mcp.json"),
+            "the user is not told why their servers are absent: {out}"
+        );
+        assert!(
+            out.contains("2 server(s)"),
+            "🔴 the count is the contradiction — 'you wrote 2 that are not served here' is \
+             the sentence that explains it: {out}"
+        );
+        assert!(
+            out.contains("console"),
+            "the user is not told where the decision happens instead: {out}"
+        );
+    }
+
+    /// The other direction, twice over: a Personal node must keep its wording,
+    /// and a control-plane node with NO local config must not be nagged.
+    ///
+    /// 能红: print the control-plane note unconditionally.
+    #[test]
+    fn test_keeps_its_wording_where_the_local_file_is_authoritative() {
+        let local = r#"{"status":"healthy","policy_source":"local_config","backends":{}}"#;
+        let out = render_health(local, None, 2);
+        assert!(
+            out.contains("hosting no backends"),
+            "🔴 a Personal node lost the message that actually applies to it: {out}"
+        );
+        assert!(!out.contains("does NOT read"), "warns on a node that reads it: {out}");
+
+        // Control plane, but the user has written nothing locally: there is no
+        // contradiction to point out, so 🚫 no note.
+        let cp = r#"{"status":"healthy","policy_source":"control_plane","backends":{}}"#;
+        let quiet = render_health(cp, None, 0);
+        assert!(
+            !quiet.contains("does NOT read"),
+            "🔴 nags a Production user who never wrote a local config: {quiet}"
+        );
+        assert!(
+            quiet.contains("organisation"),
+            "it should still say where its toolsets come from: {quiet}"
+        );
+    }
+
+    /// `aikey mcp list` must not print an endpoint that does not serve what it
+    /// just listed.
+    ///
+    /// 能红: keep the `Endpoint:` line on a control-plane node.
+    #[test]
+    fn list_footer_replaces_the_endpoint_on_a_control_plane_node() {
+        let out = render_list_footer(Some(POLICY_SOURCE_CONTROL_PLANE), "http://127.0.0.1:1/mcp/local");
+        assert!(
+            !out.contains("Endpoint:") && !out.contains("/mcp/local"),
+            "🔴 still hands the user a URL that does not serve these backends — a correct-\
+             looking URL under a warning is still the thing they copy: {out}"
+        );
+        assert!(out.contains("does NOT read ~/.aikey/mcp.json"), "{out}");
+        assert!(
+            out.contains("would take effect"),
+            "the user is not told the entries are kept, so it reads as data loss: {out}"
+        );
+
+        for source in [Some("local_config"), None] {
+            let keep = render_list_footer(source, "http://127.0.0.1:27200/mcp/local");
+            assert!(
+                keep.contains("Endpoint: http://127.0.0.1:27200/mcp/local"),
+                "🔴 {source:?}: the endpoint is gone where it is correct. `None` means the \
+                 gateway did not answer, which must not change what this prints: {keep}"
+            );
+        }
+    }
+
+    /// All three commands must describe the state in ONE wording.
+    ///
+    /// 能红: reword any one of them in place instead of via CONTROL_PLANE_HEADLINE.
+    #[test]
+    fn add_list_and_test_use_the_same_sentence_for_the_same_state() {
+        let add = render_add_next_steps(Some(POLICY_SOURCE_CONTROL_PLANE), "http://x/mcp/local");
+        let list = render_list_footer(Some(POLICY_SOURCE_CONTROL_PLANE), "http://x/mcp/local");
+        let test = render_health(
+            r#"{"status":"healthy","policy_source":"control_plane","backends":{}}"#,
+            None,
+            1,
+        );
+        for (name, text) in [("add", &add), ("list", &list), ("test", &test)] {
+            assert!(
+                text.contains(CONTROL_PLANE_HEADLINE),
+                "🔴 `{name}` describes this machine state in its own words. Three wordings \
+                 for one state is how a user comes to believe they have three problems:\n{text}"
+            );
+        }
     }
 
     /// The rendered text must actually SAY the things the fields carry. A parse
     /// that succeeds into a renderer that ignores the value is the same outage.
     #[test]
     fn the_health_render_names_the_two_counts_that_need_an_action() {
-        let out = render_health(HEALTH_CONTRACT_DOCUMENT, None);
+        // 0 local backends: this fence is about the counts, and the
+        // control-plane note below is deliberately silent when the user has
+        // written nothing locally that could be going unserved.
+        let out = render_health(HEALTH_CONTRACT_DOCUMENT, None, 0);
         assert!(out.contains("localpg"), "{out}");
         assert!(out.contains("jira"), "{out}");
         assert!(
