@@ -1,0 +1,159 @@
+# MCP client config shapes — the table `aikey mcp scan` / `aikey mcp adopt` read.
+#
+# 阶段8-平台化 · MCP 网关 · P14 task 14.1e
+# spec: workflow/CI/requirements/2026-08-20-mcp-gateway.md  (R19 / R21 / I22)
+#
+# # Why a table and not code
+#
+# Every MCP client stores its servers in its own file, and every one of those
+# files follows its own upstream's release cycle. Enumerating them with
+# `if client == "claude-code" { ... } else if ...` puts a maintenance treadmill
+# in the middle of a security path: the day Cursor moves its config, somebody
+# edits a Rust match arm in a file that also masks credentials.
+#
+# So the SHAPES live here and the code stays shape-agnostic. Adding a client is
+# an edit to this file plus a test fixture — never a new branch.
+#
+# 🔴 The honest boundary this file draws (R19 boundary 1): we can only see the
+# clients listed here. A copy of the same secret in a file we do not know about
+# is NOT found by `scan` and is NOT cleaned by `adopt`, and the report says so.
+# Growing this list is how that boundary moves — 🚫 never by claiming more.
+#
+# # Field reference
+#
+#   entry_shape          field names inside ONE server entry. Declared once,
+#                        at file level, because every client shipped today
+#                        (Claude Code, Claude Desktop, and the wider ecosystem
+#                        that copied their format) uses the same one. 🔴 When a
+#                        client turns up that disagrees, move this key INTO the
+#                        client that disagrees rather than adding a branch —
+#                        per-client `entry_shape` overrides the file-level one.
+#
+#   clients[].id         stable id used in reports, JSON output and tests
+#   clients[].display    what a human sees. 🔴 Kept in step with the client's
+#                        own name, because the report tells the user which app
+#                        to reopen.
+#   clients[].locations[]
+#       id               scope label printed beside each finding
+#       source           HOW the path is resolved. One of:
+#                          home_relative           <home>/<path>
+#                          cwd_relative            <cwd>/<path>
+#                          claude_desktop_config   the resolver already used by
+#                                                  `aikey desktop` — 🔴 NOT a
+#                                                  path spelled out here. That
+#                                                  resolver carries the Windows
+#                                                  LocalAppData-vs-Roaming rule
+#                                                  and the MSIX detection, and a
+#                                                  second spelling of it would
+#                                                  be wrong on exactly the
+#                                                  platform nobody tests on.
+#       path             only for the *_relative sources
+#       server_maps      where the server map sits inside the document, as a
+#                        path of keys. `*` matches EVERY key at that level and
+#                        the matched key is reported as the scope, which is how
+#                        Claude Code's per-project servers are found without
+#                        knowing any project's name.
+#
+#   credential_hints     how an env value is SUSPECTED of being a credential.
+#       key_patterns     glob against the variable NAME (upper-cased)
+#       value_patterns   glob against the VALUE — vendor-issued token shapes,
+#                        plus a URL that carries a password inline
+#     🔴 These produce a SUSPICION, never a decision. `adopt` asks about every
+#     hit (14.C4: `LOG_LEVEL=debug` must not be swept up silently) and the
+#     report states plainly that anything these patterns miss is still in
+#     cleartext afterwards (14.C5 / R19 boundary 2). 🚫 Never phrase a miss as
+#     "clean".
+
+version: 1
+
+# The name `aikey mcp adopt` files its own entry under.
+#
+# 🔴 It exists so `scan` can recognise ITS OWN work. After adoption the client
+# config holds an entry whose `headers.Authorization` is a bearer — which the
+# credential patterns below match, correctly, because it IS a credential. Without
+# this marker `scan` would report the gateway entry as "cleartext credential
+# found" and `adopt` would try to adopt itself on the next run (14.C6).
+#
+# 🔴 Recognised by NAME, not by URL: the proxy's port is configurable, so a
+# URL test would stop recognising our own entry on any non-default port — and
+# the failure would be to re-adopt an already-adopted machine.
+managed_entry_name: aikey
+
+entry_shape:
+  command: command
+  args: args
+  env: env
+  url: url
+  headers: headers
+  # Clients spell the remote transport in a `type` field ("http" / "sse").
+  # Absent + `command` present ⇒ stdio, which is how the ecosystem's oldest
+  # configs (no `type` at all) are read correctly.
+  transport: type
+
+clients:
+  - id: claude-code
+    display: Claude Code
+    locations:
+      - id: user
+        source: home_relative
+        path: .claude.json
+        server_maps:
+          - [mcpServers]
+          # Claude Code keeps per-project servers under the project's own
+          # directory key. 🔴 Scanning only the root map under-reports on every
+          # developer who added a server from inside a repository — and
+          # under-reporting is the dangerous direction here: it reads as "you
+          # have no cleartext left".
+          - [projects, "*", mcpServers]
+      - id: project
+        source: cwd_relative
+        path: .mcp.json
+        server_maps:
+          - [mcpServers]
+
+  - id: claude-desktop
+    display: Claude Desktop
+    locations:
+      - id: user
+        source: claude_desktop_config
+        server_maps:
+          - [mcpServers]
+
+credential_hints:
+  key_patterns:
+    - "*TOKEN*"
+    - "*SECRET*"
+    - "*PASSWORD*"
+    - "*PASSWD*"
+    - "*API_KEY*"
+    - "*APIKEY*"
+    - "*_KEY"
+    - "KEY"
+    - "*CREDENTIAL*"
+    - "*AUTH*"
+    - "*PAT"
+    - "*_PAT_*"
+    - "*DSN*"
+    - "*CONNECTION_STRING*"
+  value_patterns:
+    # Vendor-issued shapes. A hit here flags a value whose NAME gave nothing
+    # away — e.g. `GH=ghp_...`.
+    - "ghp_*"
+    - "gho_*"
+    - "ghu_*"
+    - "ghs_*"
+    - "ghr_*"
+    - "github_pat_*"
+    - "sk-*"
+    - "sk_live_*"
+    - "sk_test_*"
+    - "xoxb-*"
+    - "xoxp-*"
+    - "xapp-*"
+    - "AKIA*"
+    - "glpat-*"
+    - "eyJ*.*.*"
+    # A connection string with an inline password: scheme://user:secret@host.
+    # 🔴 This one matters most in practice — `DATABASE_URL` pointing at prod is
+    # the finding that makes the report land.
+    - "*://*:*@*"

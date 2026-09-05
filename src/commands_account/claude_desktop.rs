@@ -365,6 +365,10 @@ fn detect_installation(paths: &DesktopPaths) -> DesktopInstallation {
     }
 }
 
+/// Reads a JSON object, preserving every key. 🔴 The single reader `aikey use`,
+/// the desktop takeover and `aikey mcp adopt` all go through — see
+/// `read_json_object_for_adopt` for why adoption needs its own doorway rather
+/// than its own reader.
 fn read_json_object(path: &Path) -> Result<Value, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
@@ -461,19 +465,23 @@ pub(crate) enum RestoreResult {
 
 /// Snapshot of one path for rollback: `Some(bytes)` = file existed with
 /// this content; `None` = did not exist (rollback deletes it).
-struct Snapshot {
+/// 🔴 `pub(crate)` since 阶段8 P14: `aikey mcp adopt` reuses this exact
+/// backup/restore pair rather than growing a second one (task 14.2c/14.2d).
+/// Two implementations of "put the file back" is how one of them ends up not
+/// restoring permissions, or not deleting a file that did not exist before.
+pub(crate) struct Snapshot {
     path: PathBuf,
     content: Option<Vec<u8>>,
 }
 
 impl Snapshot {
-    fn take(path: &Path) -> Snapshot {
+    pub(crate) fn take(path: &Path) -> Snapshot {
         Snapshot {
             path: path.to_path_buf(),
             content: std::fs::read(path).ok(),
         }
     }
-    fn restore(&self) {
+    pub(crate) fn restore(&self) {
         match &self.content {
             Some(bytes) => {
                 let _ = crate::profile_activation::atomic_write(&self.path, bytes);
@@ -2561,4 +2569,18 @@ mod p2_tests {
             "one-shot grant must leave no standing pref"
         );
     }
+}
+
+/// The adoption path's doorway into the reader above (阶段8 P14 task 14.2d).
+///
+/// 🔴 A named function rather than making `read_json_object` public, so the
+/// call sites stay countable: `aikey use` and the desktop takeover must keep
+/// only PRESERVING `mcpServers`, while adoption is the one place allowed to
+/// REWRITE it (task 14.2f). Same reader, different doors — and fence 14.F8
+/// checks that the preserving paths never gained a write.
+pub(crate) fn read_json_object_for_adopt(path: &Path) -> Result<Value, String> {
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+    read_json_object(path)
 }
