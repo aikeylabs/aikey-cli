@@ -811,9 +811,22 @@ fn handle_snapshot_sync(env: StdinEnvelope) {
             Err((code, msg)) => return emit_error(req_id, code, msg),
         };
         return match crate::commands_account::run_full_snapshot_sync_with_vault_key(&key) {
-            Ok(downloaded) => emit(&ResultEnvelope::ok(
+            // capability_refused rides the envelope so a hidden-command caller
+            // (the tray / web bridge) is not handed the same silent
+            // {"downloaded": 0} the CLI used to print. Bug:
+            // workflow/CI/bugfix/20260907-team-key-delivery-is-silent-without-the-protected-module.md
+            Ok(outcome) => emit(&ResultEnvelope::ok(
                 req_id,
-                json!({ "synced": true, "downloaded": downloaded, "full": true }),
+                json!({
+                    "synced": true,
+                    "downloaded": outcome.downloaded,
+                    "full": true,
+                    "capability_refused": outcome.capability_refused.as_ref().map(|r| json!({
+                        "capability": r.capability,
+                        "code": r.code,
+                        "next_step": r.next_step(),
+                    })),
+                }),
             )),
             Err(e) => emit_error(req_id, "I_SNAPSHOT_SYNC_FAILED", e),
         };
