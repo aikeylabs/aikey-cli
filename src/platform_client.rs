@@ -697,7 +697,8 @@ impl PlatformClient {
         let url = format!("{}/accounts/login", base_url.trim_end_matches('/'));
         let body = serde_json::json!({ "email": email, "password": password });
 
-        let resp = Self::bounded(Self::BUDGET_STANDARD).post(&url)
+        let resp = Self::bounded(Self::BUDGET_STANDARD)
+            .post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| format!("login request failed: {}", explain(base_url, e)))?;
@@ -741,7 +742,8 @@ impl PlatformClient {
         // worse one.
         //
         // bugfix: workflow/CI/bugfix/2026-09-04-tray-claims-browser-opened-before-master-reached.md
-        let resp = Self::bounded(Self::BUDGET_INTERACTIVE).post(&url)
+        let resp = Self::bounded(Self::BUDGET_INTERACTIVE)
+            .post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| format!("login init failed: {}", explain(base_url, e)))?;
@@ -764,7 +766,8 @@ impl PlatformClient {
             "client_version": client_version,
             "os_platform": os_platform,
         });
-        let resp = Self::bounded(Self::BUDGET_STANDARD).post(&url)
+        let resp = Self::bounded(Self::BUDGET_STANDARD)
+            .post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| format!("login start failed: {}", explain(base_url, e)))?;
@@ -784,7 +787,8 @@ impl PlatformClient {
             "login_session_id": session_id,
             "device_code": device_code,
         });
-        let resp = Self::bounded(Self::BUDGET_STANDARD).post(&url)
+        let resp = Self::bounded(Self::BUDGET_STANDARD)
+            .post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| format!("poll request failed: {}", explain(base_url, e)))?;
@@ -807,7 +811,8 @@ impl PlatformClient {
             "login_session_id": session_id,
             "login_token": login_token,
         });
-        let resp = Self::bounded(Self::BUDGET_STANDARD).post(&url)
+        let resp = Self::bounded(Self::BUDGET_STANDARD)
+            .post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| format!("exchange request failed: {}", explain(base_url, e)))?;
@@ -827,7 +832,8 @@ impl PlatformClient {
             base_url.trim_end_matches('/')
         );
         let body = serde_json::json!({ "refresh_token": refresh_token });
-        let resp = Self::bounded(Self::BUDGET_STANDARD).post(&url)
+        let resp = Self::bounded(Self::BUDGET_STANDARD)
+            .post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| {
@@ -864,7 +870,8 @@ impl PlatformClient {
     /// where the SPA's existing 401 handling takes over).
     pub fn probe_token(base_url: &str, jwt: &str) -> Result<(), TokenProbeError> {
         let url = format!("{}/accounts/me", base_url.trim_end_matches('/'));
-        let resp = Self::bounded(Self::BUDGET_PROBE).get(&url)
+        let resp = Self::bounded(Self::BUDGET_PROBE)
+            .get(&url)
             .set("Authorization", &format!("Bearer {}", jwt))
             .call();
         match resp {
@@ -918,7 +925,8 @@ impl PlatformClient {
     /// there: this runs inside an interactive command.
     pub fn licensed_company_name(base_url: &str, jwt: &str) -> Option<String> {
         let url = format!("{}/v1/license/status", base_url.trim_end_matches('/'));
-        let body = Self::bounded(Self::BUDGET_PROBE).get(&url)
+        let body = Self::bounded(Self::BUDGET_PROBE)
+            .get(&url)
             .set("Authorization", &format!("Bearer {}", jwt))
             .call()
             .ok()?
@@ -945,7 +953,8 @@ impl PlatformClient {
             "host_info": host_info,
             "display_name": display_name,
         });
-        let resp = Self::bounded(Self::BUDGET_STANDARD).post(&url)
+        let resp = Self::bounded(Self::BUDGET_STANDARD)
+            .post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| match e {
@@ -968,7 +977,8 @@ impl PlatformClient {
     pub fn get_all_keys(&self) -> Result<Vec<KeyItem>, String> {
         let url = format!("{}/accounts/me/all-keys", self.base_url);
 
-        let resp = Self::bounded(Self::BUDGET_STANDARD).get(&url)
+        let resp = Self::bounded(Self::BUDGET_STANDARD)
+            .get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .call()
             .map_err(|e| format!("all-keys request failed: {}", explain(&self.base_url, e)))?;
@@ -1000,7 +1010,8 @@ impl PlatformClient {
     /// Bug: E2E case 2026-06-11 §L8 次生缺口.
     pub fn resolve_cluster_node(&self) -> ClusterNodeResolution {
         let url = format!("{}/accounts/me/cluster-node", self.base_url);
-        let resp = match Self::bounded(Self::BUDGET_STANDARD).get(&url)
+        let resp = match Self::bounded(Self::BUDGET_STANDARD)
+            .get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .call()
         {
@@ -1038,8 +1049,7 @@ impl PlatformClient {
     /// to pull a fresh snapshot.
     pub fn get_sync_version(&self) -> Result<SyncVersionResponse, String> {
         let url = format!("{}/accounts/me/sync-version", self.base_url);
-        let agent = ureq::AgentBuilder::new()
-            .build();
+        let agent = ureq::AgentBuilder::new().build();
         let resp = agent
             .get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
@@ -1060,8 +1070,7 @@ impl PlatformClient {
     /// so the returned `sync_version` is always fresh.
     pub fn get_managed_keys_snapshot(&self) -> Result<ManagedKeysSnapshotResponse, String> {
         let url = format!("{}/accounts/me/managed-keys-snapshot", self.base_url);
-        let agent = ureq::AgentBuilder::new()
-            .build();
+        let agent = ureq::AgentBuilder::new().build();
         let resp = agent
             .get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
@@ -1083,7 +1092,8 @@ impl PlatformClient {
     pub fn get_key_delivery(&self, virtual_key_id: &str) -> Result<DeliveryPayload, String> {
         let url = format!("{}/virtual-keys/{}/delivery", self.base_url, virtual_key_id);
 
-        let resp = Self::bounded(Self::BUDGET_STANDARD).get(&url)
+        let resp = Self::bounded(Self::BUDGET_STANDARD)
+            .get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .call()
             .map_err(|e| format!("delivery request failed: {}", explain(&self.base_url, e)))?;
@@ -1097,7 +1107,8 @@ impl PlatformClient {
     pub fn claim_key(&self, virtual_key_id: &str) -> Result<(), String> {
         let url = format!("{}/virtual-keys/{}/claim", self.base_url, virtual_key_id);
 
-        Self::bounded(Self::BUDGET_STANDARD).post(&url)
+        Self::bounded(Self::BUDGET_STANDARD)
+            .post(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .set("Content-Type", "application/json")
             .send_string("{}")
@@ -1556,10 +1567,7 @@ mod control_plane_agent_fence {
 
     /// Built at runtime so this file does not contain the needles it scans for.
     fn needles() -> [String; 2] {
-        [
-            format!("{}::post(", "ureq"),
-            format!("{}::get(", "ureq"),
-        ]
+        [format!("{}::post(", "ureq"), format!("{}::get(", "ureq")]
     }
 
     #[test]
@@ -1684,17 +1692,83 @@ mod control_plane_budget_fence {
     /// same two claims as the rest.
     fn calls() -> Vec<Call> {
         vec![
-            ("init_cli_login", |b| { let _ = PlatformClient::init_cli_login(b, "v", "os"); }, PlatformClient::BUDGET_INTERACTIVE),
-            ("login", |b| { let _ = PlatformClient::login(b, "e@x.test", "p"); }, PlatformClient::BUDGET_STANDARD),
-            ("start_cli_login", |b| { let _ = PlatformClient::start_cli_login(b, "e@x.test", "v", "os"); }, PlatformClient::BUDGET_STANDARD),
-            ("poll_cli_login", |b| { let _ = PlatformClient::poll_cli_login(b, "s", "d"); }, PlatformClient::BUDGET_STANDARD),
-            ("exchange_login_token", |b| { let _ = PlatformClient::exchange_login_token(b, "s", "t"); }, PlatformClient::BUDGET_STANDARD),
-            ("do_refresh_token", |b| { let _ = PlatformClient::do_refresh_token(b, "rt"); }, PlatformClient::BUDGET_STANDARD),
-            ("register_digital_employee", |b| { let _ = PlatformClient::register_digital_employee(b, "jt", "host", "name"); }, PlatformClient::BUDGET_STANDARD),
-            ("get_all_keys", |b| { let _ = PlatformClient::new(b, "jwt").get_all_keys(); }, PlatformClient::BUDGET_STANDARD),
-            ("resolve_cluster_node", |b| { let _ = PlatformClient::new(b, "jwt").resolve_cluster_node(); }, PlatformClient::BUDGET_STANDARD),
-            ("get_key_delivery", |b| { let _ = PlatformClient::new(b, "jwt").get_key_delivery("vk"); }, PlatformClient::BUDGET_STANDARD),
-            ("claim_key", |b| { let _ = PlatformClient::new(b, "jwt").claim_key("vk"); }, PlatformClient::BUDGET_STANDARD),
+            (
+                "init_cli_login",
+                |b| {
+                    let _ = PlatformClient::init_cli_login(b, "v", "os");
+                },
+                PlatformClient::BUDGET_INTERACTIVE,
+            ),
+            (
+                "login",
+                |b| {
+                    let _ = PlatformClient::login(b, "e@x.test", "p");
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+            (
+                "start_cli_login",
+                |b| {
+                    let _ = PlatformClient::start_cli_login(b, "e@x.test", "v", "os");
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+            (
+                "poll_cli_login",
+                |b| {
+                    let _ = PlatformClient::poll_cli_login(b, "s", "d");
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+            (
+                "exchange_login_token",
+                |b| {
+                    let _ = PlatformClient::exchange_login_token(b, "s", "t");
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+            (
+                "do_refresh_token",
+                |b| {
+                    let _ = PlatformClient::do_refresh_token(b, "rt");
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+            (
+                "register_digital_employee",
+                |b| {
+                    let _ = PlatformClient::register_digital_employee(b, "jt", "host", "name");
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+            (
+                "get_all_keys",
+                |b| {
+                    let _ = PlatformClient::new(b, "jwt").get_all_keys();
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+            (
+                "resolve_cluster_node",
+                |b| {
+                    let _ = PlatformClient::new(b, "jwt").resolve_cluster_node();
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+            (
+                "get_key_delivery",
+                |b| {
+                    let _ = PlatformClient::new(b, "jwt").get_key_delivery("vk");
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+            (
+                "claim_key",
+                |b| {
+                    let _ = PlatformClient::new(b, "jwt").claim_key("vk");
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
         ]
     }
 
@@ -1743,10 +1817,15 @@ mod control_plane_budget_fence {
         assert!(
             never_returned.is_empty(),
             "these calls never came back against a server that DID answer in {:?}: {:?}",
-            SLOW_REPLY, never_returned
+            SLOW_REPLY,
+            never_returned
         );
         for (name, took) in done {
-            let budget = budgets.iter().find(|(n, _, _)| *n == name).map(|(_, _, b)| *b).expect("known call");
+            let budget = budgets
+                .iter()
+                .find(|(n, _, _)| *n == name)
+                .map(|(_, _, b)| *b)
+                .expect("known call");
             // The load-bearing assertion: a call that returned EARLIER than the
             // server's reply cannot have completed the round trip — it timed
             // out. That is the "budget too small" regression.
@@ -1779,7 +1858,11 @@ mod control_plane_budget_fence {
             never_returned
         );
         for (name, took) in done {
-            let budget = budgets.iter().find(|(n, _, _)| *n == name).map(|(_, _, b)| *b).expect("known call");
+            let budget = budgets
+                .iter()
+                .find(|(n, _, _)| *n == name)
+                .map(|(_, _, b)| *b)
+                .expect("known call");
             assert!(
                 took <= budget + MARGIN,
                 "{name} took {took:?} against a hung server, past its {budget:?} budget"
