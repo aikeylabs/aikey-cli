@@ -4922,17 +4922,57 @@ fn managed_projection_changed_or_unknown(
     }
 }
 
+/// Whether a snapshot's key list may be treated as the server's complete,
+/// authoritative set for this account.
+///
+/// 🔴 Why this is a type rather than a bool threaded through the call sites.
+/// The prune below draws a DESTRUCTIVE conclusion from an ABSENCE: "the server
+/// did not list this key, therefore it is gone." That inference is only valid
+/// when the server actually computed the list. On a capability refusal it did
+/// not — it served the LAST PUBLISHED projection, which on a deployment that
+/// never published one is the empty set (D3.1 / R8). Reading that as "every
+/// team key was removed" turns a control-plane fault into a data-plane one,
+/// which is the exact outcome that degrade exists to prevent.
+/// Bug: workflow/CI/bugfix/20260907-team-key-delivery-is-silent-without-the-protected-module.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotAuthority {
+    /// The control plane recomputed the projection: an absence IS a removal.
+    Authoritative,
+    /// The control plane served a projection it could not recompute. An absence
+    /// means "unknown", never "removed".
+    Degraded,
+}
+
+impl SnapshotAuthority {
+    /// Derives one snapshot response's authority.
+    ///
+    /// Kept here so both sync paths cannot disagree: the refusal headers are the
+    /// ONLY thing on the wire that separates "this account has no team keys"
+    /// from "this deployment could not work out your team keys" — the two
+    /// bodies are byte-for-byte identical.
+    fn of(snapshot: &crate::platform_client::ManagedKeysSnapshotResponse) -> Self {
+        match snapshot.capability_refused {
+            Some(_) => Self::Degraded,
+            None => Self::Authoritative,
+        }
+    }
+}
+
 /// Merges a server snapshot into the local managed_virtual_keys_cache.
 ///
 /// Coverage rules (design doc §5.3):
 /// - Server fields overwrite local server-mirrored fields.
 /// - Local-only fields (local_alias, key material, owner_account_id) are preserved.
 /// - local_state is recomputed from effective_status / effective_reason.
-/// - Keys owned by current account that are absent from the snapshot are marked `stale`.
+/// - Keys owned by current account that are absent from the snapshot are DELETED
+///   (2026-07-04 self-heal, see the prune block) — but only when `authority` says
+///   the server actually computed the list.
 fn apply_snapshot_to_cache(
     items: &[crate::platform_client::ManagedKeySnapshotItem],
     current_account_id: &str,
+    authority: SnapshotAuthority,
 ) {
+    use colored::Colorize;
     use std::collections::HashSet;
     let active_env_before = active_managed_env_projection();
     // P1e (design D-11): the cache is one row per binding, so the sync tracks the
@@ -5113,6 +5153,7 @@ fn apply_snapshot_to_cache(
         .collect();
     if let Ok(cached) = storage::list_virtual_key_cache() {
         let mut pruned = 0usize;
+        let mut kept_unverifiable = 0usize;
         for entry in cached {
             if should_prune_cached_binding(
                 entry.owner_account_id.as_deref() == Some(current_account_id),
@@ -5126,6 +5167,32 @@ fn apply_snapshot_to_cache(
                     &entry.provider_code,
                 )),
             ) {
+                // 🔴 P1 (2026-09-07): this row is superseded ACCORDING TO THIS
+                // SNAPSHOT — and on a degraded snapshot that sentence is worth
+                // nothing. The control plane told us (in the refusal headers) that
+                // it could not recompute the projection, so what it served is the
+                // last published one, which on a deployment that never published
+                // is empty. Deleting on that basis is how a licensing or module
+                // fault on the CONTROL plane silently destroys working team keys
+                // on every member's machine — and then clears their active route
+                // below, so the proxy stops routing on the next reload too.
+                //
+                // Observed 2026-09-07 during acceptance of the refusal signal:
+                // "pruned 1 server-removed key(s) from local cache" on a machine
+                // whose key was never removed. The server degraded exactly as
+                // D3.1 / R8 intends; the client cancelled the degrade out.
+                //
+                // 🚫 Keep, do not mark stale: a stale row is unusable, and
+                // "unusable" is precisely the outcome being prevented. The row is
+                // untouched and the next authoritative snapshot prunes it if it
+                // really is gone (the prune is idempotent).
+                // Bug: workflow/CI/bugfix/20260907-team-key-delivery-is-silent-without-the-protected-module.md
+                // Fence: degraded_snapshot_keeps_absent_keys_and_the_active_route
+                if authority == SnapshotAuthority::Degraded {
+                    kept_unverifiable += 1;
+                    continue;
+                }
+
                 // If this binding's VK was the active proxy key AND the whole VK is
                 // gone (no surviving binding), clear the active key config so the
                 // proxy stops routing it on next reload.
@@ -5162,6 +5229,16 @@ fn apply_snapshot_to_cache(
         }
         if pruned > 0 {
             println!("  pruned {pruned} server-removed key(s) from local cache");
+        }
+        // Said out loud, per the mandatory-WARN rule: keys were deliberately kept
+        // that this snapshot did not list. Silence here would leave the vault in a
+        // state nobody chose and nobody can see.
+        if kept_unverifiable > 0 {
+            eprintln!(
+                "  {} Kept {kept_unverifiable} team key(s) this snapshot did not list: the control plane \
+                 could not recompute it, so their absence is not proof they were removed.",
+                "\u{25b2}".yellow()
+            );
         }
     }
 
@@ -5261,7 +5338,11 @@ pub fn run_snapshot_sync() -> Result<bool, String> {
         Err(e) => return Err(format!("snapshot: {}", e)),
     };
 
-    apply_snapshot_to_cache(&snapshot.keys, &acc.account_id);
+    apply_snapshot_to_cache(
+        &snapshot.keys,
+        &acc.account_id,
+        SnapshotAuthority::of(&snapshot),
+    );
     apply_quota_snapshot_to_cache(&snapshot.quota);
 
     // Record the new version so the next command skips the snapshot pull.
@@ -5536,7 +5617,11 @@ fn run_full_snapshot_sync_opts(
     // delivery path serving, and personal keys below are unaffected.
     let capability_refused = snapshot.capability_refused.clone();
 
-    apply_snapshot_to_cache(&snapshot.keys, &acc.account_id);
+    apply_snapshot_to_cache(
+        &snapshot.keys,
+        &acc.account_id,
+        SnapshotAuthority::of(&snapshot),
+    );
     apply_quota_snapshot_to_cache(&snapshot.quota);
     storage::set_local_seen_sync_version(snapshot.sync_version);
     let _ = storage::bump_vault_change_seq();
@@ -11531,7 +11616,7 @@ mod sync_prune_tests {
 
         // Empty snapshot for acct-A → its row must be DELETED; acct-B's row
         // (another server session's cache) must be untouched.
-        apply_snapshot_to_cache(&[], "acct-A");
+        apply_snapshot_to_cache(&[], "acct-A", SnapshotAuthority::Authoritative);
 
         let left = storage::list_virtual_key_cache().unwrap();
         assert!(
@@ -11548,8 +11633,114 @@ mod sync_prune_tests {
         );
 
         // Idempotent: a second pass has nothing to prune and must not error.
-        apply_snapshot_to_cache(&[], "acct-A");
+        apply_snapshot_to_cache(&[], "acct-A", SnapshotAuthority::Authoritative);
         assert_eq!(storage::list_virtual_key_cache().unwrap().len(), 1);
+    }
+
+    /// P1 (2026-09-07): a snapshot the control plane could NOT recompute must
+    /// not be read as "the server removed everything".
+    ///
+    /// # What went wrong
+    ///
+    /// The server degrades on a capability refusal by serving the last published
+    /// projection (D3.1 / R8), so that a licensing or module fault never becomes
+    /// a delivery outage. On a deployment that never published one, that
+    /// projection is the EMPTY SET — and the prune above read the empty set as
+    /// "every team key was deleted". Observed on a real machine during
+    /// acceptance: `pruned 1 server-removed key(s) from local cache` for a key
+    /// nobody had removed, plus `clear_active_key_config()`, so the proxy
+    /// stopped routing it on the next reload. One control-plane fault, every
+    /// member's working keys gone.
+    ///
+    /// # Why this test asserts BOTH halves
+    ///
+    /// A test that only pinned the degraded case would be satisfied by never
+    /// pruning at all — which would resurrect the ghost rows the 2026-07-04
+    /// self-heal exists to remove. The authoritative half is what makes the
+    /// degraded half a discriminator rather than a constant.
+    ///
+    /// 能红: drop the `SnapshotAuthority::Degraded` guard in the prune loop and
+    /// the first half fails; drop the prune entirely and the second half fails.
+    #[test]
+    fn degraded_snapshot_keeps_absent_keys_and_the_active_route() {
+        let (_dir, _lock) = setup_vault();
+
+        let mut mine = cache_entry("vk-degraded", "acct-A");
+        mine.local_state = "active".to_string();
+        storage::upsert_virtual_key_cache(&mine).unwrap();
+        storage::set_active_key_config(&storage::ActiveKeyConfig {
+            key_type: crate::credential_type::CredentialType::ManagedVirtualKey,
+            key_ref: "vk-degraded".to_string(),
+            providers: vec!["anthropic".to_string()],
+        })
+        .unwrap();
+
+        // The same empty snapshot as the authoritative test above; the ONLY
+        // variable is the authority.
+        apply_snapshot_to_cache(&[], "acct-A", SnapshotAuthority::Degraded);
+
+        let left = storage::list_virtual_key_cache().unwrap();
+        let kept = left
+            .iter()
+            .find(|e| e.virtual_key_id == "vk-degraded")
+            .expect(
+                "a snapshot the control plane could not recompute says nothing about \
+                 which keys still exist; deleting on its silence destroys working team \
+                 keys on every member machine when the CONTROL plane is the thing that \
+                 broke",
+            );
+        assert_ne!(
+            kept.local_state, "stale",
+            "the row must be kept USABLE, not demoted — unusable is the outcome \
+             being prevented"
+        );
+        let cfg = storage::get_active_key_config()
+            .unwrap()
+            .expect("the member's active route must survive a degraded snapshot");
+        assert_eq!(cfg.key_ref, "vk-degraded");
+
+        // The pair: with an authoritative snapshot the same absence IS a removal,
+        // and the active route is cleared. Without this, "never prune" would pass.
+        apply_snapshot_to_cache(&[], "acct-A", SnapshotAuthority::Authoritative);
+        assert!(
+            !storage::list_virtual_key_cache()
+                .unwrap()
+                .iter()
+                .any(|e| e.virtual_key_id == "vk-degraded"),
+            "an authoritative snapshot that omits an owned key must still prune it"
+        );
+        assert!(
+            storage::get_active_key_config().unwrap().is_none(),
+            "and must still clear the active route it pointed at"
+        );
+    }
+
+    /// The derivation itself. Without this the guard above is fenced but its
+    /// INPUT is not: `of()` could return Authoritative unconditionally, every
+    /// other test would still pass, and the bug would be back.
+    ///
+    /// 能红: make `of` ignore `capability_refused`.
+    #[test]
+    fn refusal_headers_are_what_makes_a_snapshot_degraded() {
+        let mut snap: crate::platform_client::ManagedKeysSnapshotResponse =
+            serde_json::from_str(r#"{"sync_version":1,"keys":[]}"#).expect("minimal snapshot");
+        assert_eq!(
+            SnapshotAuthority::of(&snap),
+            SnapshotAuthority::Authoritative,
+            "a response with no refusal header is the server's real answer"
+        );
+
+        snap.capability_refused = Some(crate::platform_client::CapabilityRefusal {
+            capability: "routing.snapshot.compile".to_string(),
+            code: "capability_unavailable".to_string(),
+        });
+        assert_eq!(
+            SnapshotAuthority::of(&snap),
+            SnapshotAuthority::Degraded,
+            "the refusal headers are the ONLY thing on the wire separating \
+             'no team keys' from 'could not work out your team keys' — the two \
+             bodies are byte-for-byte identical"
+        );
     }
 }
 
