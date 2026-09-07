@@ -77,6 +77,7 @@ mod commands_trust;
 mod commands_watch;
 #[allow(dead_code)]
 mod display_language;
+mod display_theme;
 #[allow(dead_code)]
 mod events;
 #[allow(dead_code)]
@@ -1396,6 +1397,18 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     println!("{}", serde_json::json!({"display_language": current}));
                 } else {
                     println!("Tray display language: {}", current);
+                }
+            }
+            cli::ConfigAction::Theme { value } => {
+                let current = if let Some(value) = value {
+                    display_theme::set_preference(value)?
+                } else {
+                    display_theme::preference()
+                };
+                if cli.json {
+                    println!("{}", serde_json::json!({"display_theme": current}));
+                } else {
+                    println!("Tray theme: {}", current);
                 }
             }
         },

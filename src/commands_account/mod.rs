@@ -3625,6 +3625,11 @@ pub fn handle_status_overview_with(
             // one command — a preference the UI must honour should not cost a
             // second CLI surface.
             "display_language": crate::display_language::preference(),
+            // The tray's theme: "auto" (follow the OS) or a forced
+            // "light"/"dark". Rides status for the same reason the language
+            // does — the tray already reads this one command, and a preference
+            // the UI must honour should not cost a second CLI surface.
+            "display_theme": crate::display_theme::preference(),
             "usage": if include_usage {
                 serde_json::to_value(crate::usage_console::today_hourly()).ok()
             } else {

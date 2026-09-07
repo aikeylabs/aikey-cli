@@ -723,6 +723,12 @@ pub(crate) enum ConfigAction {
         /// Omit to show the current preference
         value: Option<String>,
     },
+    /// Show or set the desktop tray's theme (`auto`, `light`, `dark`)
+    #[command(name = "theme")]
+    Theme {
+        /// Omit to show the current preference
+        value: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1536,6 +1542,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
             Commands::Config { action } => match action {
                 ConfigAction::TimeZone { .. } => "config.time-zone".to_string(),
                 ConfigAction::Language { .. } => "config.language".to_string(),
+                ConfigAction::Theme { .. } => "config.theme".to_string(),
             },
             Commands::Db { action } => format!(
                 "db.{}",

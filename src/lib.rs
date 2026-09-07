@@ -19,6 +19,7 @@ pub mod control_plane_error;
 pub mod credential_type;
 pub mod crypto;
 pub mod display_language;
+pub mod display_theme;
 pub mod enterprise_proxy;
 pub mod env_renderer;
 pub mod env_resolver;
