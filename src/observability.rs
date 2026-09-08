@@ -289,9 +289,14 @@ pub const EVENT_CLI_TP_CONFIG_REFUSED: &str = "cli.third_party_config.refused";
 // best-effort — a keychain can decline — and a silent decline would leave the
 // proxy asking for a password the user believes they already configured.
 pub const EVENT_CLI_VAULT_SESSION_CACHE_SKIPPED: &str = "cli.vault.session_cache_skipped";
+// The OS keychain refused an UNATTENDED read (no UI allowed) and the encrypted
+// file cache was used instead. Emitted by session::try_get_unattended.
+pub const EVENT_CLI_VAULT_SESSION_KEYCHAIN_UNATTENDED_DENIED: &str =
+    "cli.vault.session_keychain_unattended_denied";
 
 // UPPER_SNAKE error codes (logging-conventions.md).
 pub const ERRCODE_SESSION_BACKEND_UNKNOWN: &str = "SESSION_BACKEND_UNKNOWN";
+pub const ERRCODE_SESSION_KEYCHAIN_UNATTENDED_DENIED: &str = "SESSION_KEYCHAIN_UNATTENDED_DENIED";
 pub const ERRCODE_BINDING_MATERIAL_UNREACHABLE: &str = "BINDING_MATERIAL_UNREACHABLE";
 pub const ERRCODE_KIMI_STOP_PAYLOAD_UNRECOGNIZED: &str = "KIMI_STOP_PAYLOAD_UNRECOGNIZED";
 pub const ERRCODE_KIMI_SESSION_DIR_MISSING: &str = "KIMI_SESSION_DIR_MISSING";

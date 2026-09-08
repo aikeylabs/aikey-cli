@@ -469,10 +469,95 @@ pub fn try_get_unattended() -> Option<SecretString> {
     }
     let pref = crate::storage::get_session_backend_pref()?;
     match pref.as_str() {
-        "keychain" => keychain_get().or_else(file_get),
+        "keychain" => keychain_get_unattended().or_else(file_get),
         "file" => file_get(),
         _ => None, // "disabled" or unknown → user opted out
     }
+}
+
+/// Keychain read for the UNATTENDED path: never allowed to wait for a human.
+///
+/// 🔴 WHY (2026-09-08, found live after an overwrite install). The macOS
+/// keychain trusts an ad-hoc-signed binary by its HASH, so every replaced
+/// `~/.aikey/bin/aikey` is a stranger to the item it wrote last week. Reading it
+/// then needs the "aikey wants to use your confidential information" click —
+/// and the proxy is started by launchd with no GUI session and stdin on
+/// /dev/null, so `SecKeychainFindGenericPassword` simply waited for a click that
+/// could never come (sampled: 4+ minutes inside CSSM decrypt, no child spawned,
+/// nothing logged). The `.or_else(file_get)` fallback below was correct and
+/// unreachable: the keychain call blocked instead of failing.
+///
+/// So this path tells the Security framework up front that no UI is allowed.
+/// A refused read then comes back as an ERROR immediately, the encrypted-file
+/// cache takes over, and the refusal is logged with a code an operator can
+/// search for. "No entry at all" stays silent — that is a normal state, not a
+/// fault. Interactive paths (`try_get`) keep their prompt: a human at a terminal
+/// is exactly who the keychain should ask.
+fn keychain_get_unattended() -> Option<SecretString> {
+    let entry =
+        keychain_ui_disallowed(|| keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)).ok()?;
+    match keychain_ui_disallowed(|| entry.get_password()) {
+        Ok(pw) if pw.is_empty() => None,
+        Ok(pw) => Some(SecretString::new(pw)),
+        Err(keyring::Error::NoEntry) => None,
+        Err(e) => {
+            crate::observability::log_warn_event(
+                crate::observability::EVENT_CLI_VAULT_SESSION_KEYCHAIN_UNATTENDED_DENIED,
+                &format!(
+                    "OS keychain refused an unattended read ({e}); using the encrypted file cache. \
+                     On macOS this is expected once after the aikey binary was replaced — \
+                     run any aikey command from a terminal once to re-approve keychain access"
+                ),
+                Some(crate::observability::ERRCODE_SESSION_KEYCHAIN_UNATTENDED_DENIED),
+            );
+            None
+        }
+    }
+}
+
+/// Run `f` with keychain user interaction disallowed, restoring the previous
+/// setting afterwards. The setting is process-wide in the Security framework,
+/// which is fine here: the unattended path is the only caller, and it restores.
+#[cfg(target_os = "macos")]
+fn keychain_ui_disallowed<T>(f: impl FnOnce() -> T) -> T {
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        fn SecKeychainSetUserInteractionAllowed(state: u8) -> i32;
+        fn SecKeychainGetUserInteractionAllowed(state: *mut u8) -> i32;
+    }
+    let mut prev: u8 = 1;
+    // SAFETY: plain C calls into Security.framework with a valid out-pointer;
+    // no memory is shared beyond the call.
+    unsafe {
+        SecKeychainGetUserInteractionAllowed(&mut prev);
+        SecKeychainSetUserInteractionAllowed(0);
+    }
+    let out = f();
+    unsafe {
+        SecKeychainSetUserInteractionAllowed(prev);
+    }
+    out
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_ui_disallowed<T>(f: impl FnOnce() -> T) -> T {
+    // Windows Credential Manager and Linux secret-service reads do not block
+    // on a per-binary ACL prompt the way the macOS keychain does.
+    f()
+}
+
+/// Exposed for the test below: whether the Security framework would show UI.
+#[cfg(all(target_os = "macos", test))]
+fn keychain_ui_allowed() -> bool {
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        fn SecKeychainGetUserInteractionAllowed(state: *mut u8) -> i32;
+    }
+    let mut v: u8 = 1;
+    unsafe {
+        SecKeychainGetUserInteractionAllowed(&mut v);
+    }
+    v != 0
 }
 
 /// Ask the user once whether to enable the OS keychain for session caching.
@@ -1002,5 +1087,57 @@ mod injected_password_isolation_tests {
         );
 
         std::env::remove_var("AK_TEST_PASSWORD");
+    }
+}
+
+#[cfg(test)]
+mod unattended_keychain_tests {
+    use super::*;
+
+    // 🔴 The unattended path must be the one that cannot wait for a click. The
+    // hang was inside the Security framework, so the only thing a unit test can
+    // pin is the switch this path flips — and that it flips it BACK.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unattended_read_disallows_keychain_ui_and_restores_it() {
+        let before = keychain_ui_allowed();
+        let inside = keychain_ui_disallowed(|| keychain_ui_allowed());
+        let after = keychain_ui_allowed();
+        assert!(!inside, "keychain UI was still allowed inside the unattended read — a replaced binary would block launchd's proxy start on a prompt nobody can click");
+        assert_eq!(
+            after, before,
+            "the process-wide keychain UI setting was not restored"
+        );
+    }
+
+    // The fix is only real if try_get_unattended actually goes through the
+    // guarded read. Source-level, because the keychain itself is not testable here.
+    #[test]
+    fn try_get_unattended_uses_the_guarded_read() {
+        let src = include_str!("session.rs");
+        let start = src
+            .find("pub fn try_get_unattended()")
+            .expect("try_get_unattended exists");
+        let body = &src[start..start + 600];
+        assert!(
+            body.contains("keychain_get_unattended().or_else(file_get)"),
+            "try_get_unattended no longer routes the keychain arm through keychain_get_unattended; the file-cache fallback is unreachable again when the ACL wants a click"
+        );
+        let fstart = src
+            .find("fn keychain_get_unattended()")
+            .expect("guarded read exists");
+        let fbody = &src[fstart..fstart + 900];
+        assert!(
+            fbody.contains("keychain_ui_disallowed(|| entry.get_password())"),
+            "the guarded read does not disallow UI around get_password"
+        );
+        assert!(
+            fbody.contains("Err(keyring::Error::NoEntry) => None"),
+            "a plain 'no entry' must stay silent — it is a normal state, not a fault"
+        );
+        assert!(
+            fbody.contains("EVENT_CLI_VAULT_SESSION_KEYCHAIN_UNATTENDED_DENIED"),
+            "a refused read must be logged with its event name (fallbacks must WARN)"
+        );
     }
 }
