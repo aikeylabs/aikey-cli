@@ -1074,6 +1074,105 @@ mod tests {
       }
     }"#;
 
+    // ── 收纳的三条诚实边界（tasks 14.C4 / 14.C5 / 14.C9）────────────────
+    //
+    // 🔴 All three are about what adoption REFUSES or DISCLOSES, and all three
+    // fail the same way if they regress: the customer believes their machine is
+    // clean when it is not. None of them shows up as an error — the command
+    // succeeds and says something slightly too confident.
+
+    /// 14.C4 — a value that looks like a setting, not a credential.
+    ///
+    /// 🔴 The server is REFUSED, not half-migrated. `~/.aikey/mcp.json`
+    /// deliberately has no env map (P5: its absence IS the feature), so an
+    /// ordinary setting like `LOG_LEVEL` has nowhere to go. Adopting anyway
+    /// would start the server WITHOUT it: the tools appear and then misbehave,
+    /// which is worse than not adopting — a broken server that looks adopted is
+    /// harder to diagnose than one that was plainly skipped.
+    ///
+    /// 🚫 The fix is never "add an env map here". That reopens the hole P5
+    /// closed, and the refusal is the recorded decision (tasks 14.2).
+    #[test]
+    fn c4_a_non_secret_env_var_refuses_the_server_instead_of_dropping_it() {
+        let (_d, report) = scan_home(MACHINE);
+        let plan = plan(&report, &[]);
+
+        let github = plan
+            .skipped
+            .iter()
+            .find(|(name, _)| name == "github")
+            .expect("🔴 `github` carries GITHUB_TOKEN *and* LOG_LEVEL; it must be SKIPPED, not \
+                     adopted with the setting silently dropped");
+        match &github.1 {
+            SkipReason::NonSecretEnv { vars } => {
+                assert!(
+                    vars.iter().any(|v| v == "LOG_LEVEL"),
+                    "🔴 the refusal must NAME the variable that blocked it — \
+                     \"this server was skipped\" with no reason is a dead end for the user. got {vars:?}"
+                );
+            }
+            other => panic!(
+                "🔴 skipped for the wrong reason: {other:?}. A non-secret env var is its own \
+                 refusal, and collapsing it into another reason loses the one sentence that \
+                 tells the user what to do next"
+            ),
+        }
+        assert!(
+            !plan.items.iter().any(|i| i.name == "github"),
+            "🔴 `github` appears in the ADOPT list. Its LOG_LEVEL would be dropped and the \
+             server would start misconfigured — tools present, behaviour wrong"
+        );
+    }
+
+    /// 14.6 — switching back to a direct connection is not blocked.
+    ///
+    /// 🔴 D-22 decided this deliberately: adoption must be REVERSIBLE by hand.
+    /// A developer who edits `mcpServers` back to the original command has to
+    /// get their tools working again, immediately, with no support ticket — a
+    /// migration you cannot walk out of is one people refuse to walk into.
+    ///
+    /// What makes that true is an ABSENCE, which is why it needs a fence: there
+    /// is no watcher, no re-apply on start-up, no periodic reconcile that would
+    /// quietly put the gateway entry back. The honest consequence — those calls
+    /// then no longer traverse AiKey — is reported by the conversation audit as
+    /// `bypassed` (P13 leg B), 🚫 not prevented here.
+    ///
+    /// 🚫 If a "keep adopted servers in sync" feature is ever added, this test is
+    /// the one that must be re-argued first. Re-writing a developer's config
+    /// behind their back is exactly the behaviour that makes a tool untrusted.
+    #[test]
+    fn c14_6_nothing_re_applies_the_rewrite_behind_the_users_back() {
+        let src = include_str!("mcp_adopt.rs");
+        let scan_src = include_str!("mcp_scan.rs");
+        for (name, body) in [("mcp_adopt.rs", src), ("mcp_scan.rs", scan_src)] {
+            // 🔴 PRODUCT CODE ONLY — cut at `#[cfg(test)]`, then drop comments.
+            //
+            // The first version scanned the whole file and reported itself: the
+            // forbidden list below is, verbatim, a set of forbidden tokens, so
+            // the fence read its own array as the violation. That is the third
+            // self-bite of this shape in one sitting (a fence on its subject's
+            // documentation, a fence on a legitimate value's prefix, this one),
+            // and the lesson is the same each time: a source scan must be given
+            // exactly the region the rule is about, or the only way to make it
+            // green is to delete the rule's own statement of itself.
+            let product = body.split("#[cfg(test)]").next().unwrap_or(body);
+            let code: String = product
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for forbidden in ["notify::", "RecommendedWatcher", "spawn_blocking", "thread::spawn"] {
+                assert!(
+                    !code.contains(forbidden),
+                    "🔴 {name} grew {forbidden:?}. Adoption rewrites a developer's own config \
+                     file ONCE, when they ask for it. Anything that re-applies it — a watcher, \
+                     a background thread, a reconcile loop — takes a decision away from them \
+                     and makes D-22's 'you can always go back' false"
+                );
+            }
+        }
+    }
+
     /// An in-memory vault that can be told to fail.
     struct FakeVault {
         stored: std::collections::BTreeMap<String, String>,

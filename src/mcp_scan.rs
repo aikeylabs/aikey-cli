@@ -1035,6 +1035,24 @@ fn print_scan_boundaries(out: &mut String, report: &ScanReport) {
         out,
         "    will still be in cleartext after `aikey mcp adopt`."
     );
+    // 🔴 The third honest boundary (task 14.C9). An aggregator — one MCP server
+    // that fronts several others — is indistinguishable from any other stdio
+    // command at scan time: we see `npx some-gateway`, not what it proxies. A
+    // customer who adopts one and then reads "3 servers, all behind the
+    // gateway" would believe their whole tool surface is governed, when the
+    // tools that aggregator exposes were never enumerated here at all.
+    //
+    // 🚫 Do not soften this into "may not cover". It either covers what is
+    // behind an aggregator or it does not, and it does not.
+    let _ = writeln!(
+        out,
+        "  · A server that itself fronts other MCP servers (an aggregator) is listed"
+    );
+    let _ = writeln!(
+        out,
+        "    as one server. What it proxies is not visible here and is not governed"
+    );
+    let _ = writeln!(out, "    by adopting it.");
     let _ = writeln!(out, "  · Nothing was changed. This command only reads.");
     for s in &report.sources {
         if let SourceStatus::Unresolvable { reason } = &s.status {
@@ -1263,6 +1281,80 @@ mod tests {
         );
         let text = render_scan(&r);
         assert!(text.contains("no config file at"), "{text}");
+    }
+
+    /// One machine with the shapes these boundaries are about: a recognised
+    /// credential, a non-secret setting, and a plain command that could just as
+    /// well be an aggregator.
+    fn scan_a_machine() -> (tempfile::TempDir, ScanReport) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            r#"{"mcpServers":{
+                 "github":{"command":"npx","env":{"GITHUB_TOKEN":"ghp_zzzzzzzzzzzzzzzzzzzzzzzz","LOG_LEVEL":"debug"}},
+                 "gateway":{"command":"npx","args":["-y","some-mcp-aggregator"]}
+               }}"#,
+        )
+        .expect("write");
+        let r = scan(&ScanRoots {
+            home: Some(dir.path().to_path_buf()),
+            cwd: None,
+            claude_desktop_config: None,
+        });
+        (dir, r)
+    }
+
+    /// 14.C5 — a value that IS a credential but that we do not recognise.
+    ///
+    /// 🔴 Two halves, and the second is the one that gets lost. Behaviourally an
+    /// unrecognised variable lands in `other_env` and therefore REFUSES the
+    /// server (14.C4's path), so nothing is half-migrated. But the customer's
+    /// mental model after a successful adopt is "my machine is clean", and the
+    /// report is the only place that can say otherwise.
+    ///
+    /// 🚫 Never let this disclosure become optional prose. Recognition is by
+    /// name and by known token shapes; a secret in `MY_COMPANY_THING` is not
+    /// listed, and after adopting everything else it is still sitting there in
+    /// cleartext.
+    #[test]
+    fn c5_the_report_says_recognition_is_best_effort() {
+        let text = render_scan(&scan_a_machine().1);
+
+        for needle in [
+            "recognised by name and by known token shapes",
+            "we do not recognise",
+            "will still be in cleartext",
+        ] {
+            assert!(
+                text.contains(needle),
+                "🔴 the scan report no longer says {needle:?}. Without it a customer reads \
+                 \"2 credentials moved\" as \"my machine is clean\", and the one in the \
+                 variable we did not recognise stays in cleartext with nobody looking for it.\n\
+                 --- report ---\n{text}"
+            );
+        }
+    }
+
+    /// 14.C9 — an aggregator: one server fronting several others.
+    ///
+    /// 🔴 Structurally invisible to the scan. We see `npx some-gateway`; what it
+    /// proxies is behind a protocol we never speak during a scan. A customer who
+    /// adopts one and reads "3 servers" believes their whole tool surface is
+    /// governed — and the tools behind that aggregator were never enumerated.
+    #[test]
+    fn c9_the_report_says_it_cannot_see_behind_an_aggregator() {
+        let text = render_scan(&scan_a_machine().1);
+        assert!(
+            text.contains("aggregator"),
+            "🔴 the scan report does not mention aggregators at all. This is the third of the \
+             three honest boundaries (12.6c): we cannot see what an aggregator proxies, and \
+             saying nothing lets the customer assume we can.\n--- report ---\n{text}"
+        );
+        assert!(
+            text.contains("is not governed") || text.contains("not governed"),
+            "🔴 mentioning aggregators is not enough — the report must say adopting one does \
+             NOT govern what is behind it.\n--- report ---\n{text}"
+        );
     }
 
     /// An unresolvable location is reported, not swallowed.

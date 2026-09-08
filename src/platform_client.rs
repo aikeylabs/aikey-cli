@@ -242,6 +242,57 @@ pub struct ManagedKeysSnapshotResponse {
     /// was not a cluster at all. The server knows; now it says so.
     #[serde(default)]
     pub key_delivery_form: Option<String>,
+    /// The control plane could not recompute the projection this response is
+    /// built from, and said so in `X-AiKey-Capability-Refused` /
+    /// `X-AiKey-Capability-Refusal-Code`. `None` = it recomputed normally (or
+    /// the server predates the headers).
+    ///
+    /// 🔴 Why this is not in the JSON body: the body is the thing that cannot
+    /// carry the signal. On a refusal the server serves the LAST PUBLISHED
+    /// projection by design (D3.1/R8 — a licensing problem must not become a
+    /// delivery outage), and where nothing was ever published that is the EMPTY
+    /// SET. `{"keys": []}` with a 200 is then byte-for-byte the honest answer
+    /// "this account holds no team keys". These headers are the only thing on
+    /// the wire that separates the two, and until 2026-09-07 nothing read them:
+    /// `aikey key sync` printed "0 key(s) downloaded", exited 0, and the user
+    /// had no way to learn their team keys could not be delivered at all.
+    /// Bug: workflow/CI/bugfix/20260907-team-key-delivery-is-silent-without-the-protected-module.md
+    #[serde(skip)]
+    pub capability_refused: Option<CapabilityRefusal>,
+}
+
+/// A capability the control plane refused to run, named on the wire.
+#[derive(Debug, Clone)]
+pub struct CapabilityRefusal {
+    /// e.g. "routing.snapshot.compile".
+    pub capability: String,
+    /// e.g. "capability_unavailable" / "module_fault" / "rejected_input".
+    ///
+    /// 🚫 The three codes are never collapsed server-side (pkg/snapshot), so we
+    /// carry the code rather than a boolean: "never activated" and "the module
+    /// trapped once" call for different next steps.
+    pub code: String,
+}
+
+impl CapabilityRefusal {
+    /// The operator-facing next step for this refusal.
+    ///
+    /// Kept next to the code so a new refusal code cannot reach a user as a bare
+    /// string with no guidance.
+    pub fn next_step(&self) -> &'static str {
+        match self.code.as_str() {
+            "capability_unavailable" => {
+                "this control plane has not been activated — reinstall the release and re-run activation"
+            }
+            "module_fault" => {
+                "the control plane's licensed module failed to run — retry, and if it persists reinstall the release"
+            }
+            "rejected_input" => {
+                "the control plane declined to publish this configuration — ask an administrator to check the console"
+            }
+            _ => "ask an administrator to check the control plane's licensing status",
+        }
+    }
 }
 
 /// How this deployment delivers key material — the client mirror of the
@@ -1004,8 +1055,30 @@ impl PlatformClient {
                     explain(&self.base_url, e)
                 )
             })?;
-        resp.into_json::<ManagedKeysSnapshotResponse>()
-            .map_err(|e| format!("failed to parse managed-keys-snapshot response: {}", e))
+        // 🔴 Read the refusal headers BEFORE consuming the body: into_json takes
+        // `resp` by value. They are the only signal that the empty key list we
+        // may be about to parse is a REFUSAL rather than an honest "no team keys"
+        // (see CapabilityRefusal). Bug: workflow/CI/bugfix/20260907-team-key-delivery-is-silent-without-the-protected-module.md
+        let refusal = resp.header("X-AiKey-Capability-Refused").and_then(|cap| {
+            let cap = cap.trim();
+            if cap.is_empty() {
+                return None;
+            }
+            Some(CapabilityRefusal {
+                capability: cap.to_string(),
+                code: resp
+                    .header("X-AiKey-Capability-Refusal-Code")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+            })
+        });
+
+        let mut parsed = resp
+            .into_json::<ManagedKeysSnapshotResponse>()
+            .map_err(|e| format!("failed to parse managed-keys-snapshot response: {}", e))?;
+        parsed.capability_refused = refusal;
+        Ok(parsed)
     }
 
     // ---- Key delivery -------------------------------------------------------

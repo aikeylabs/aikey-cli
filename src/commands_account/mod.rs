@@ -4999,7 +4999,7 @@ pub fn run_snapshot_sync() -> Result<bool, String> {
 /// Requires the master password to encrypt downloaded provider keys into the vault.
 ///
 /// Returns the number of newly downloaded keys.
-pub fn run_full_snapshot_sync(password: &SecretString) -> Result<usize, String> {
+pub fn run_full_snapshot_sync(password: &SecretString) -> Result<SyncOutcome, String> {
     let vault_key = derive_vault_key(password)?;
     run_full_snapshot_sync_with_vault_key(&vault_key)
 }
@@ -5019,7 +5019,7 @@ pub fn run_full_snapshot_sync(password: &SecretString) -> Result<usize, String> 
 /// download instead of silently skipping (which left ciphertext NULL and the
 /// DE proxy with an empty registry — bug
 /// 20260611-form2-de-proxy-token-registry-mismatch).
-pub fn run_full_snapshot_sync_for_agent(password: &SecretString) -> Result<usize, String> {
+pub fn run_full_snapshot_sync_for_agent(password: &SecretString) -> Result<SyncOutcome, String> {
     let vault_key = derive_vault_key(password)?;
     run_full_snapshot_sync_opts(&vault_key, true)
 }
@@ -5144,8 +5144,28 @@ pub(crate) fn upsert_delivered_key(
 
 pub fn run_full_snapshot_sync_with_vault_key(
     vault_key: &[u8; crypto::KEY_SIZE],
-) -> Result<usize, String> {
+) -> Result<SyncOutcome, String> {
     run_full_snapshot_sync_opts(vault_key, false)
+}
+
+/// What one snapshot sync did, and anything the control plane refused while
+/// doing it.
+///
+/// 🔴 Why this replaced a bare `usize` (2026-09-07). `downloaded` alone cannot
+/// distinguish "you have no team keys" from "this control plane cannot deliver
+/// team keys at all": both are 0. The human path could paper over that with an
+/// `eprintln!` from inside the core (the way form-① central delivery does just
+/// below), but `--json` could not — it printed `{"ok": true, "downloaded": 0}`,
+/// which is the exact silent-success shape the bug is about, to the consumer
+/// most likely to act on it unattended (the form-② agent daemon).
+/// Bug: workflow/CI/bugfix/20260907-team-key-delivery-is-silent-without-the-protected-module.md
+#[derive(Debug, Default)]
+pub struct SyncOutcome {
+    /// Newly downloaded key material count.
+    pub downloaded: usize,
+    /// Set when the control plane served this snapshot without being able to
+    /// recompute it. `None` is the normal, healthy case.
+    pub capability_refused: Option<crate::platform_client::CapabilityRefusal>,
 }
 
 /// Inner sync core. `allow_cluster_key_download` is true ONLY for the form-②
@@ -5154,7 +5174,7 @@ pub fn run_full_snapshot_sync_with_vault_key(
 fn run_full_snapshot_sync_opts(
     vault_key: &[u8; crypto::KEY_SIZE],
     allow_cluster_key_download: bool,
-) -> Result<usize, String> {
+) -> Result<SyncOutcome, String> {
     use colored::Colorize;
 
     // Strict-verify before any encrypt write: a vault_key that does not
@@ -5168,7 +5188,7 @@ fn run_full_snapshot_sync_opts(
 
     let acc = match storage::get_platform_account().ok().flatten() {
         Some(a) => a,
-        None => return Ok(0),
+        None => return Ok(SyncOutcome::default()),
     };
     let token = match try_refresh_if_needed(&acc) {
         Ok(t) => t,
@@ -5231,6 +5251,12 @@ fn run_full_snapshot_sync_opts(
         }
         Err(e) => return Err(format!("snapshot: {}", e)),
     };
+
+    // The control plane may have served this snapshot WITHOUT being able to
+    // recompute it (see CapabilityRefusal). Captured here, reported once at the
+    // end and returned in the outcome — never used to abort: D3.1/R8 keeps the
+    // delivery path serving, and personal keys below are unaffected.
+    let capability_refused = snapshot.capability_refused.clone();
 
     apply_snapshot_to_cache(&snapshot.keys, &acc.account_id);
     apply_quota_snapshot_to_cache(&snapshot.quota);
@@ -5483,7 +5509,39 @@ fn run_full_snapshot_sync_opts(
         }
     }
 
-    Ok(downloaded)
+    // 🔴 The refusal, said out loud. Reported HERE (the core fn) for the same
+    // reason form-① central delivery above is: every caller — `aikey key sync`,
+    // `aikey list`, the `use` bridge, the form-② daemon — reaches the server
+    // through this function, and a message only the explicit sync command
+    // printed would leave the others exactly as silent as the bug.
+    //
+    // 🚫 Never an error and never an abort. The control plane deliberately keeps
+    // serving here (D3.1/R8); personal keys synced fine, and turning a licensing
+    // problem into a failed sync is the outcome that design exists to prevent.
+    // What is NOT acceptable is the previous behaviour: 0 team keys, exit 0, no
+    // explanation anywhere.
+    // Bug: workflow/CI/bugfix/20260907-team-key-delivery-is-silent-without-the-protected-module.md
+    if let Some(refusal) = &capability_refused {
+        eprintln!(
+            "  {} Team keys could not be refreshed: the control plane cannot run `{}` ({}).",
+            "\u{25b2}".yellow(),
+            refusal.capability,
+            refusal.code
+        );
+        eprintln!(
+            "     Any team key issued since its last successful publish is MISSING from this sync,"
+        );
+        eprintln!(
+            "     and a deployment that never published one has none to give — {}.",
+            refusal.next_step()
+        );
+        eprintln!("     Your personal keys are unaffected.");
+    }
+
+    Ok(SyncOutcome {
+        downloaded,
+        capability_refused,
+    })
 }
 
 /// Returns true if the remote sync_version differs from local (i.e. server has changes).
@@ -5855,7 +5913,8 @@ pub fn handle_key_sync(
     }
     // Force a full sync by resetting local_seen_sync_version to 0.
     storage::set_local_seen_sync_version(0);
-    let downloaded = run_full_snapshot_sync(password)?;
+    let outcome = run_full_snapshot_sync(password)?;
+    let downloaded = outcome.downloaded;
 
     // Production form-⓪ multi-protocol delivery (Phase 3, 20260717): if this
     // member's control panel serves the enterprise (mihomo) proxy, pull + verify
@@ -5897,9 +5956,20 @@ pub fn handle_key_sync(
     }
 
     if json_mode {
+        // 🔴 `capability_refused` rides the SAME success envelope rather than
+        // flipping `ok` to false: the sync did succeed (personal keys landed),
+        // and a machine consumer that treats a licensing refusal as a failed
+        // sync would retry forever. What it must never see again is
+        // {"ok": true, "downloaded": 0} with nothing else to read.
+        // Bug: workflow/CI/bugfix/20260907-team-key-delivery-is-silent-without-the-protected-module.md
         crate::json_output::print_json(serde_json::json!({
             "ok": true,
             "downloaded": downloaded,
+            "capability_refused": outcome.capability_refused.as_ref().map(|r| serde_json::json!({
+                "capability": r.capability,
+                "code": r.code,
+                "next_step": r.next_step(),
+            })),
             "auto_activated_providers": reconciled.iter().flat_map(|(_, p)| p.clone()).collect::<Vec<String>>(),
         }));
     } else {
@@ -10136,7 +10206,12 @@ mod core_tests {
             "correct vault_key must pass verify; got {:?}",
             result
         );
-        assert_eq!(result.unwrap(), 0, "no platform account → no downloads");
+        let outcome = result.unwrap();
+        assert_eq!(outcome.downloaded, 0, "no platform account → no downloads");
+        assert!(
+            outcome.capability_refused.is_none(),
+            "no server was contacted, so nothing can have refused anything"
+        );
     }
 }
 

@@ -1845,8 +1845,18 @@ fn print_status_kimi() {
 // ---------------------------------------------------------------------------
 // Helpers for settings manipulation.
 // ---------------------------------------------------------------------------
+//
+// 🔴 `pub(crate)` rather than private since P15: `mcp_guard` writes a SECOND key
+// into the same `settings.json` and must reuse these, not grow a parallel copy.
+// The hazards here — atomic write, first-backup-wins, honouring
+// `CLAUDE_CONFIG_DIR`, refusing a malformed file — were each paid for once
+// already, and a second implementation would have to rediscover them.
+//
+// 🚫 The two features must stay independent in EFFECT: `mcp_guard` never touches
+// `statusLine` and this module never touches `hooks`. Sharing the primitives is
+// not sharing the state.
 
-fn claude_settings_path() -> Option<PathBuf> {
+pub(crate) fn claude_settings_path() -> Option<PathBuf> {
     Some(claude_config_dir_with_source().0.join("settings.json"))
 }
 
@@ -1893,13 +1903,13 @@ fn statusline_backup_path(settings_path: &Path) -> PathBuf {
 }
 
 #[derive(Debug)]
-enum ReadError {
+pub(crate) enum ReadError {
     NotFound,
     Malformed(serde_json::Error),
     Io(io::Error),
 }
 
-fn read_settings(path: &Path) -> Result<serde_json::Value, ReadError> {
+pub(crate) fn read_settings(path: &Path) -> Result<serde_json::Value, ReadError> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(ReadError::NotFound),
@@ -1914,7 +1924,7 @@ fn read_settings(path: &Path) -> Result<serde_json::Value, ReadError> {
 /// Backup the current settings.json verbatim when it exists.  Skips silently
 /// if there's nothing to back up, or if a previous backup is already present
 /// (we never overwrite — the first backup is the canonical "original state").
-fn backup_settings(settings_path: &Path) -> io::Result<()> {
+pub(crate) fn backup_settings(settings_path: &Path) -> io::Result<()> {
     if !settings_path.exists() {
         return Ok(());
     }
@@ -1930,7 +1940,7 @@ fn backup_settings(settings_path: &Path) -> io::Result<()> {
 /// rename it into place.  Matches the pattern the proxy uses for its own
 /// snapshot files — Claude Code may be reading settings.json at any moment
 /// as it renders the status line, so we can't tolerate a half-written file.
-fn write_settings_atomic(settings_path: &Path, value: &serde_json::Value) -> io::Result<()> {
+pub(crate) fn write_settings_atomic(settings_path: &Path, value: &serde_json::Value) -> io::Result<()> {
     let parent = settings_path.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "settings path has no parent")
     })?;
