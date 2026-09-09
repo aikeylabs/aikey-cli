@@ -1789,8 +1789,18 @@ fn print_status_kimi() {
 // ---------------------------------------------------------------------------
 // Helpers for settings manipulation.
 // ---------------------------------------------------------------------------
+//
+// 🔴 `pub(crate)` rather than private since P15: `mcp_guard` writes a SECOND key
+// into the same `settings.json` and must reuse these, not grow a parallel copy.
+// The hazards here — atomic write, first-backup-wins, honouring
+// `CLAUDE_CONFIG_DIR`, refusing a malformed file — were each paid for once
+// already, and a second implementation would have to rediscover them.
+//
+// 🚫 The two features must stay independent in EFFECT: `mcp_guard` never touches
+// `statusLine` and this module never touches `hooks`. Sharing the primitives is
+// not sharing the state.
 
-fn claude_settings_path() -> Option<PathBuf> {
+pub(crate) fn claude_settings_path() -> Option<PathBuf> {
     Some(claude_config_dir_with_source().0.join("settings.json"))
 }
 
@@ -1858,6 +1868,31 @@ fn statusline_command_of(doc: &serde_json::Value) -> Option<&str> {
         .filter(|c| !c.is_empty())
 }
 
+/// Strict parse of Claude Code's `settings.json`.
+///
+/// 🔴 ONE definition, because TWO surfaces read this same file: `ClaudeSurface`
+/// (the statusLine slot) and `mcp_guard::McpGuardSurface` (the PreToolUse
+/// delegation hook). If they disagreed about what "parses" means, one of them
+/// would refuse a file the other had just written.
+///
+/// A whitespace-only file has always meant "no settings" here. Valid JSON that
+/// is not an object is an ERROR, not an empty document: the code before the
+/// guard silently replaced it with `{}`, which threw the user's content away.
+pub(crate) fn parse_claude_settings(text: &str) -> Result<serde_json::Value, tp::ParseFailure> {
+    if text.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    let v = tp::parse_json_strict(text)?;
+    if !v.is_object() {
+        return Err(tp::ParseFailure {
+            line: Some(1),
+            col: Some(1),
+            msg: "top level is not a JSON object".into(),
+        });
+    }
+    Ok(v)
+}
+
 impl tp::Surface for ClaudeSurface {
     type Doc = serde_json::Value;
     type Input = ClaudeInput;
@@ -1877,21 +1912,7 @@ impl tp::Surface for ClaudeSurface {
         claude_settings_path().unwrap_or_else(|| PathBuf::from("settings.json"))
     }
     fn load(&self, text: &str) -> Result<Self::Doc, tp::ParseFailure> {
-        // A whitespace-only file has always meant "no settings" here.
-        if text.trim().is_empty() {
-            return Ok(serde_json::json!({}));
-        }
-        let v = tp::parse_json_strict(text)?;
-        if !v.is_object() {
-            // Valid JSON but not a settings object: the old code silently
-            // replaced it with `{}` — which threw the user's content away.
-            return Err(tp::ParseFailure {
-                line: Some(1),
-                col: Some(1),
-                msg: "top level is not a JSON object".into(),
-            });
-        }
-        Ok(v)
+        parse_claude_settings(text)
     }
     fn empty_doc(&self) -> Self::Doc {
         serde_json::json!({})
@@ -2014,6 +2035,7 @@ fn format_number(n: i64) -> String {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     }
 }
+
 
 #[cfg(test)]
 mod tests {

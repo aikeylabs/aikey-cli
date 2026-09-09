@@ -7512,8 +7512,12 @@ mod hook_uninstall_tests {
 // (bytes and mtime untouched, no backup written), `hook repair --strip-ours`
 // removes only aikey's own lines and leaves the user's provider intact.
 // spec: R-third-party-config-guard-1.S2 / -2.S2 / -3.S1
+// 🔴 `pub(crate)` so `mcp_guard::tests` can reuse `Sandbox` — the HOME /
+// USERPROFILE / CLAUDE_CONFIG_DIR redirect plus ENV_MUTATION_LOCK — instead of
+// growing a second copy of it. Test-only; `#[cfg(test)]` keeps it out of the
+// binary. The guard writes the SAME settings.json this suite covers.
 #[cfg(test)]
-mod tp_invalid_file_suite {
+pub(crate) mod tp_invalid_file_suite {
     use super::*;
     use crate::test_env_lock::ENV_MUTATION_LOCK;
     use tp::Surface as _;
@@ -7532,13 +7536,13 @@ mod tp_invalid_file_suite {
         )
     }
 
-    struct Sandbox {
+    pub(crate) struct Sandbox {
         _guard: std::sync::MutexGuard<'static, ()>,
         _tmp: tempfile::TempDir,
         prev_home: Option<std::ffi::OsString>,
         prev_up: Option<std::ffi::OsString>,
         prev_ccd: Option<std::ffi::OsString>,
-        cfg: std::path::PathBuf,
+        pub(crate) cfg: std::path::PathBuf,
     }
 
     impl Sandbox {
@@ -7572,7 +7576,7 @@ mod tp_invalid_file_suite {
                 cfg,
             }
         }
-        fn with_claude(content: Option<&str>) -> Self {
+        pub(crate) fn with_claude(content: Option<&str>) -> Self {
             Sandbox::at(".claude", content)
         }
         fn with(content: &str) -> Self {

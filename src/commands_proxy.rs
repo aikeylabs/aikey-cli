@@ -107,6 +107,93 @@ fn build_start_options(
     Ok((opts, env_keys))
 }
 
+/// Read one `section:` → `key:` scalar out of the proxy yaml.
+///
+/// 🔴 A line scanner, not a YAML parse, and that is the existing convention in
+/// this file (see read_yaml_port_drift_enabled below) rather than a shortcut:
+/// the CLI reads three scalars out of a file the daemon owns, and pulling in a
+/// full deserialisation of the daemon's config struct would make every field
+/// the daemon adds a compile-time concern for the CLI.
+///
+/// Returns None for "not present", which every caller must map to the SAME
+/// default the Go side uses. 🔴 Not to a guess of its own — a CLI that resolves
+/// a different path from the daemon reports "no records" for a database that is
+/// being written to right now, and nothing about that output looks wrong.
+fn read_yaml_scalar(path: &std::path::Path, section: &str, key: &str) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let want_section = format!("{section}:");
+    let want_key = format!("{key}:");
+    let mut in_section = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == want_section {
+            in_section = true;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix(&want_key) {
+            let v = rest.trim().trim_matches('"').trim_matches('\'').trim();
+            return if v.is_empty() { None } else { Some(v.to_string()) };
+        }
+        // A non-indented, non-comment line ends the section.
+        if !trimmed.is_empty() && !trimmed.starts_with('#') && !line.starts_with(' ') && !line.starts_with('\t') {
+            break;
+        }
+    }
+    None
+}
+
+/// Where the proxy keeps its events database — the same file the daemon opens.
+///
+/// 🔴 The default MUST stay byte-identical to the Go side's
+/// `config.DefaultEventsDBPath`. There is no shared schema between a Rust CLI
+/// and a Go daemon, so the only thing holding these two in step is a test on
+/// each side asserting the same literal — the same arrangement `~/.aikey/mcp.json`
+/// needed in task 5.6, and for the same reason: when they drift, NOTHING errors.
+/// The CLI simply reports an empty history for a database the daemon is filling.
+///
+/// Fence: proxy_events_db_path_matches_the_daemon_default (here) +
+/// TestEventsDBPathDefaultMatchesTheCLI (aikey-proxy).
+pub(crate) const DEFAULT_EVENTS_DB_PATH: &str = "~/.aikey/data/events.db";
+
+/// Retention window for local records, mirroring `config.DefaultWALRetentionDays`.
+pub(crate) const DEFAULT_WAL_RETENTION_DAYS: i64 = 30;
+
+/// Resolve `events.db_path` exactly as the daemon would.
+pub(crate) fn read_yaml_events_db_path(config_path: Option<&std::path::Path>) -> PathBuf {
+    let raw = config_path
+        .map(|p| p.to_path_buf())
+        .or_else(|| resolve_config(None).ok())
+        .and_then(|p| read_yaml_scalar(&p, "events", "db_path"))
+        .unwrap_or_else(|| DEFAULT_EVENTS_DB_PATH.to_string());
+    expand_home(&raw)
+}
+
+/// Resolve `events.wal_retention_days`, so the CLI can tell a user how far back
+/// the local record actually goes instead of leaving "where are my older calls"
+/// unanswered.
+pub(crate) fn read_yaml_retention_days(config_path: Option<&std::path::Path>) -> i64 {
+    config_path
+        .map(|p| p.to_path_buf())
+        .or_else(|| resolve_config(None).ok())
+        .and_then(|p| read_yaml_scalar(&p, "events", "wal_retention_days"))
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_WAL_RETENTION_DAYS)
+}
+
+/// `~`-expansion, matching the daemon's own expandHome.
+fn expand_home(raw: &str) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(raw)
+}
+
 /// Whether `listen.port_drift_max` in the proxy yaml enables port drift.
 /// Mirrors the Go side's semantics (supervisor.Listen + config defaults):
 /// absent → default ON; `0` → coerced to the default (ON); only an explicit
@@ -1935,7 +2022,7 @@ pub fn proxy_guard(password: &SecretString) -> bool {
 /// loaded automatically — we emit a stderr advisory so developers who relied
 /// on the old behavior notice the change instead of silently switching to a
 /// different config.
-fn resolve_config(explicit: Option<&str>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub(crate) fn resolve_config(explicit: Option<&str>) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(p) = explicit {
         let path = PathBuf::from(p);
         if !path.exists() {
