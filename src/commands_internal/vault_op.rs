@@ -2626,15 +2626,19 @@ fn handle_test_raw(env: StdinEnvelope) {
     } else {
         payload.alias_hint.clone()
     };
-    let base_url_override = if payload.base_url.trim().is_empty() {
-        None
+    // Decode exactly like `apply_add_core_on_conn` will on save, so the
+    // pre-save probe and the stored key agree (connection-string paste,
+    // bare-host base_url). See `crate::credential_input`.
+    let decoded = crate::credential_input::decode_secret_input(&payload.secret);
+    let base_url_override: Option<&str> = if payload.base_url.trim().is_empty() {
+        decoded.embedded_base_url.as_deref()
     } else {
-        Some(payload.base_url.as_str())
+        Some(payload.base_url.trim())
     };
 
     let targets = crate::commands_project::targets_from_new_personal_key(
         &alias_hint,
-        payload.secret.trim(),
+        &decoded.secret,
         &payload.providers,
         base_url_override,
     );

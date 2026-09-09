@@ -680,6 +680,59 @@ pub(crate) fn parse_licensed_company_name(body: &str) -> Option<String> {
 
 impl PlatformClient {
     /// Creates a new client using a JWT already stored in `platform_account`.
+    // ── Control-plane time budgets (2026-09-04) ──────────────────────────────
+    //
+    // Every call in this file talks to a master that, in a private deployment,
+    // fails by BLACK-HOLING packets (dropped, no RST). Unbounded, such a call
+    // hangs for the OS connect/read retry budget — tens of seconds with no
+    // feedback. On 2026-09-04, 11 of 13 calls here had no budget at all.
+    //
+    // Two budgets, not ten hand-picked numbers: the distinction that actually
+    // changes the right answer is "is a human watching a spinner right now?".
+    // Anything finer would be numbers without a reason behind them.
+    /// A human is staring at a spinner and will read "it is broken" into any
+    /// longer wait. Only `init_cli_login` qualifies: aikey-tray's panel claims
+    /// a browser window opened the moment the CLI process starts, so THIS call's
+    /// budget is the lifetime of that claim.
+    pub(crate) const BUDGET_INTERACTIVE: std::time::Duration = std::time::Duration::from_secs(5);
+    /// Everything else: background, retryable, or already behind its own
+    /// progress output. Generous on purpose — a loaded private-deployment
+    /// master is allowed to be slow (`start_cli_login` even sends mail
+    /// server-side). Too tight would turn "slow but alive" into "cannot sign
+    /// in", which is a worse bug than the one being fixed.
+    pub(crate) const BUDGET_STANDARD: std::time::Duration = std::time::Duration::from_secs(15);
+    /// Read-only probe with a cached fallback: failing fast costs nothing, and
+    /// two of these sit on `aikey web`'s hot path.
+    pub(crate) const BUDGET_PROBE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// A ureq agent that actually honours `budget` — including the TCP connect.
+    ///
+    /// 🔴 WHY AN AGENT AND NOT A PER-REQUEST `.timeout()` (2026-09-04, learned
+    /// the hard way). ureq's request-level `.timeout()` does NOT bound the
+    /// connect phase; that is `timeout_connect`, an AGENT setting whose default
+    /// is 30s. A master that BLACK-HOLES packets never completes the connect, so
+    /// a request-level budget never gets a chance to apply.
+    ///
+    /// Measured on winpc2 the same day, against a black-holed address, WITH a
+    /// 5s request-level timeout already in place: **21.21s**, ending in Windows
+    /// `os error 10060` — the OS connect timeout, not our budget. The first fix
+    /// bounded the read phase and left the real-world failure untouched; the
+    /// fence missed it because it used a server that ACCEPTS the connection.
+    /// `timeout_connect` takes precedence over `timeout` for that phase (ureq
+    /// 2.12 agent.rs:405), so both are set here and the tighter one wins.
+    ///
+    /// A bare AgentBuilder carries no proxy config — the same posture as the
+    /// `ureq::post` calls it replaces, and deliberate: see the note on
+    /// `commands_proxy::fetch_compliance_packs`. Do not make it proxy-aware.
+    ///
+    /// bugfix: workflow/CI/bugfix/2026-09-04-tray-claims-browser-opened-before-master-reached.md
+    fn bounded(budget: std::time::Duration) -> ureq::Agent {
+        ureq::AgentBuilder::new()
+            .timeout_connect(budget)
+            .timeout(budget)
+            .build()
+    }
+
     pub fn new(base_url: &str, jwt: &str) -> Self {
         PlatformClient {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -695,7 +748,8 @@ impl PlatformClient {
         let url = format!("{}/accounts/login", base_url.trim_end_matches('/'));
         let body = serde_json::json!({ "email": email, "password": password });
 
-        let resp = ureq::post(&url)
+        let resp = Self::bounded(Self::BUDGET_STANDARD)
+            .post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| format!("login request failed: {}", explain(base_url, e)))?;
@@ -720,7 +774,27 @@ impl PlatformClient {
             "client_version": client_version,
             "os_platform": os_platform,
         });
-        let resp = ureq::post(&url)
+        // 🔴 5s budget (2026-09-04, user decision "5s 弹登录失败吧").
+        //
+        // WHY this call in particular: it is the FIRST thing both the browser
+        // and the --sso flows do, and the browser is only opened AFTER it
+        // returns. Until it does, aikey-tray's panel already shows "请在刚打开
+        // 的浏览器窗口完成授权" — a window that does not exist yet. Unbounded,
+        // that false sentence stood for the OS connect timeout (tens of seconds
+        // against a black-holed host, which is exactly how a private-deployment
+        // master fails: packets dropped, no RST). Bounded, the panel flips to a
+        // real error with the real reason within 5s.
+        //
+        // WHY 5s and not the 2s its siblings use: probe_token/licensed_company_name
+        // are read-only probes with a cached fallback, so failing fast costs
+        // nothing. This POST CREATES a login session on the server, and a loaded
+        // private-deployment master is allowed to be slow — a 2s budget would
+        // turn "slow but alive" into "cannot sign in", trading one bug for a
+        // worse one.
+        //
+        // bugfix: workflow/CI/bugfix/2026-09-04-tray-claims-browser-opened-before-master-reached.md
+        let resp = Self::bounded(Self::BUDGET_INTERACTIVE)
+            .post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| format!("login init failed: {}", explain(base_url, e)))?;
@@ -743,7 +817,8 @@ impl PlatformClient {
             "client_version": client_version,
             "os_platform": os_platform,
         });
-        let resp = ureq::post(&url)
+        let resp = Self::bounded(Self::BUDGET_STANDARD)
+            .post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| format!("login start failed: {}", explain(base_url, e)))?;
@@ -763,7 +838,8 @@ impl PlatformClient {
             "login_session_id": session_id,
             "device_code": device_code,
         });
-        let resp = ureq::post(&url)
+        let resp = Self::bounded(Self::BUDGET_STANDARD)
+            .post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| format!("poll request failed: {}", explain(base_url, e)))?;
@@ -786,7 +862,8 @@ impl PlatformClient {
             "login_session_id": session_id,
             "login_token": login_token,
         });
-        let resp = ureq::post(&url)
+        let resp = Self::bounded(Self::BUDGET_STANDARD)
+            .post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| format!("exchange request failed: {}", explain(base_url, e)))?;
@@ -806,7 +883,8 @@ impl PlatformClient {
             base_url.trim_end_matches('/')
         );
         let body = serde_json::json!({ "refresh_token": refresh_token });
-        let resp = ureq::post(&url)
+        let resp = Self::bounded(Self::BUDGET_STANDARD)
+            .post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| {
@@ -843,9 +921,9 @@ impl PlatformClient {
     /// where the SPA's existing 401 handling takes over).
     pub fn probe_token(base_url: &str, jwt: &str) -> Result<(), TokenProbeError> {
         let url = format!("{}/accounts/me", base_url.trim_end_matches('/'));
-        let resp = ureq::get(&url)
+        let resp = Self::bounded(Self::BUDGET_PROBE)
+            .get(&url)
             .set("Authorization", &format!("Bearer {}", jwt))
-            .timeout(std::time::Duration::from_secs(2))
             .call();
         match resp {
             Ok(_) => Ok(()),
@@ -898,9 +976,9 @@ impl PlatformClient {
     /// there: this runs inside an interactive command.
     pub fn licensed_company_name(base_url: &str, jwt: &str) -> Option<String> {
         let url = format!("{}/v1/license/status", base_url.trim_end_matches('/'));
-        let body = ureq::get(&url)
+        let body = Self::bounded(Self::BUDGET_PROBE)
+            .get(&url)
             .set("Authorization", &format!("Bearer {}", jwt))
-            .timeout(std::time::Duration::from_secs(2))
             .call()
             .ok()?
             .into_string()
@@ -926,7 +1004,8 @@ impl PlatformClient {
             "host_info": host_info,
             "display_name": display_name,
         });
-        let resp = ureq::post(&url)
+        let resp = Self::bounded(Self::BUDGET_STANDARD)
+            .post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| match e {
@@ -949,7 +1028,8 @@ impl PlatformClient {
     pub fn get_all_keys(&self) -> Result<Vec<KeyItem>, String> {
         let url = format!("{}/accounts/me/all-keys", self.base_url);
 
-        let resp = ureq::get(&url)
+        let resp = Self::bounded(Self::BUDGET_STANDARD)
+            .get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .call()
             .map_err(|e| format!("all-keys request failed: {}", explain(&self.base_url, e)))?;
@@ -981,7 +1061,8 @@ impl PlatformClient {
     /// Bug: E2E case 2026-06-11 §L8 次生缺口.
     pub fn resolve_cluster_node(&self) -> ClusterNodeResolution {
         let url = format!("{}/accounts/me/cluster-node", self.base_url);
-        let resp = match ureq::get(&url)
+        let resp = match Self::bounded(Self::BUDGET_STANDARD)
+            .get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .call()
         {
@@ -1019,9 +1100,7 @@ impl PlatformClient {
     /// to pull a fresh snapshot.
     pub fn get_sync_version(&self) -> Result<SyncVersionResponse, String> {
         let url = format!("{}/accounts/me/sync-version", self.base_url);
-        let agent = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(2))
-            .build();
+        let agent = ureq::AgentBuilder::new().build();
         let resp = agent
             .get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
@@ -1042,9 +1121,7 @@ impl PlatformClient {
     /// so the returned `sync_version` is always fresh.
     pub fn get_managed_keys_snapshot(&self) -> Result<ManagedKeysSnapshotResponse, String> {
         let url = format!("{}/accounts/me/managed-keys-snapshot", self.base_url);
-        let agent = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(2))
-            .build();
+        let agent = ureq::AgentBuilder::new().build();
         let resp = agent
             .get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
@@ -1088,7 +1165,8 @@ impl PlatformClient {
     pub fn get_key_delivery(&self, virtual_key_id: &str) -> Result<DeliveryPayload, String> {
         let url = format!("{}/virtual-keys/{}/delivery", self.base_url, virtual_key_id);
 
-        let resp = ureq::get(&url)
+        let resp = Self::bounded(Self::BUDGET_STANDARD)
+            .get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .call()
             .map_err(|e| format!("delivery request failed: {}", explain(&self.base_url, e)))?;
@@ -1102,7 +1180,8 @@ impl PlatformClient {
     pub fn claim_key(&self, virtual_key_id: &str) -> Result<(), String> {
         let url = format!("{}/virtual-keys/{}/claim", self.base_url, virtual_key_id);
 
-        ureq::post(&url)
+        Self::bounded(Self::BUDGET_STANDARD)
+            .post(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .set("Content-Type", "application/json")
             .send_string("{}")
@@ -1530,5 +1609,337 @@ mod licensed_company_name_tests {
         let inner = "AiKey  Labs   (Shenzhen)";
         let body = format!(r#"{{"schema_version":1,"company_name":"  {inner}  "}}"#);
         assert_eq!(parse_licensed_company_name(&body).as_deref(), Some(inner));
+    }
+}
+
+// ── Every control-plane call must go through bounded() (2026-09-04) ─────────
+#[cfg(test)]
+mod control_plane_agent_fence {
+    //! 🔴 The invariant this file learned the hard way.
+    //!
+    //! The FIRST attempt at this fence asserted "every ureq call sets
+    //! `.timeout(`". It went green, and the bug survived: a request-level
+    //! timeout does not bound the TCP connect, and a black-holed master never
+    //! completes one. Measured on winpc2 with that "fix" installed: **21.21s**
+    //! to fail, ending in Windows `os error 10060` — the OS connect timeout.
+    //!
+    //! So the invariant is not "a timeout is set somewhere". It is: **the call
+    //! goes through `PlatformClient::bounded()`**, the one constructor that sets
+    //! `timeout_connect`. Asserting the mechanism instead of the symptom is the
+    //! whole lesson — the symptom test agreed with a broken fix.
+    //!
+    //! Deterministic on purpose (source scan, no network): the connect phase
+    //! cannot be exercised reliably in a unit test — reproducing it needs an
+    //! address that black-holes packets, which depends on the box's network.
+    //! The empirical half lives in the bugfix as a measured before/after on a
+    //! real Windows machine; this half makes sure nobody re-introduces a bare
+    //! call afterwards.
+    //!
+    //! bugfix: workflow/CI/bugfix/2026-09-04-tray-claims-browser-opened-before-master-reached.md
+    const SELF_MODULE: &str = "mod control_plane_agent_fence";
+
+    /// Built at runtime so this file does not contain the needles it scans for.
+    fn needles() -> [String; 2] {
+        [format!("{}::post(", "ureq"), format!("{}::get(", "ureq")]
+    }
+
+    #[test]
+    fn no_bare_ureq_calls_outside_the_bounded_constructor() {
+        let src = include_str!("platform_client.rs");
+        // Everything from this module onward is fence code, not product code.
+        let product = &src[..src.find(SELF_MODULE).unwrap_or(src.len())];
+        let mut offenders = Vec::new();
+        for (n, line) in product.lines().enumerate() {
+            if needles().iter().any(|nd| line.contains(nd.as_str())) {
+                // The constructor itself is the one legitimate site.
+                if line.contains("AgentBuilder") {
+                    continue;
+                }
+                offenders.push(format!("line {}: {}", n + 1, line.trim()));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "control-plane call(s) bypassing PlatformClient::bounded():\n  {}\n\n             A bare ureq call inherits ureq's 30s connect default, and a master \
+             that black-holes packets never completes the connect — the request \
+             budget never applies (winpc2 2026-09-04: 21.21s, os error 10060). \
+             Route it through bounded(BUDGET_PROBE / BUDGET_INTERACTIVE / \
+             BUDGET_STANDARD).",
+            offenders.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn bounded_actually_sets_the_connect_timeout() {
+        let src = include_str!("platform_client.rs");
+        let body_start = src.find("fn bounded(budget:").expect("bounded() exists");
+        let body = &src[body_start..body_start + 400];
+        assert!(
+            body.contains("timeout_connect("),
+            "bounded() no longer sets timeout_connect — every call in this file \
+             silently reverts to ureq's 30s connect default, which is the exact \
+             defect this constructor exists to prevent."
+        );
+    }
+}
+
+// ── Control-plane budget fence (2026-09-04) ──────────────────────────────────
+#[cfg(test)]
+mod control_plane_budget_fence {
+    //! Written BEFORE the 10 remaining calls were bounded (user instruction:
+    //! "修复之前要有充分围栏测试，避免引发其他问题"), so that the fence is proven
+    //! to catch the defect rather than merely agreeing with the fix.
+    //!
+    //! Two claims, and the SECOND one is the reason this file exists:
+    //!
+    //!   1. a hung master must not hang the CLI  — RED before the fix
+    //!   2. a SLOW BUT ALIVE master must still succeed — GREEN before AND after
+    //!
+    //! Claim 2 is the regression guard. The realistic way to break this code is
+    //! not "forgot a timeout", it is "picked one that is too small", which turns
+    //! a slow private-deployment master into one nobody can sign in to — worse
+    //! than the bug being fixed. Claim 2 fails the moment a budget drops under
+    //! the server delay.
+    //!
+    //! Why timing assertions and not response fixtures: proving "the round trip
+    //! completed" needs only `elapsed >= server_delay` — had the call timed out
+    //! early it would have returned BEFORE the server ever replied. That holds
+    //! for all ten calls without building ten response shapes, so the fence does
+    //! not rot when a DTO changes.
+    //!
+    //! bugfix: workflow/CI/bugfix/2026-09-04-tray-claims-browser-opened-before-master-reached.md
+    use super::PlatformClient;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// Server delay used by the "slow but alive" claim. Comfortably longer than
+    /// any plausible LAN round trip, comfortably shorter than every budget.
+    const SLOW_REPLY: Duration = Duration::from_secs(1);
+    /// Slack over a budget before we call a bounded call "unbounded".
+    const MARGIN: Duration = Duration::from_secs(4);
+
+    /// Spawns a local server. `reply_after == None` means "accept the
+    /// connection and never answer" — the black-holed-master shape, and the
+    /// only one that reproduces an unbounded wait deterministically (an
+    /// unroutable IP would depend on the CI box's network).
+    fn spawn(reply_after: Option<Duration>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    // Drain what arrived; the request is small enough to land in
+                    // one read, and nothing here needs to parse it.
+                    let mut buf = [0u8; 8192];
+                    let _ = stream.read(&mut buf);
+                    match reply_after {
+                        Some(d) => {
+                            std::thread::sleep(d);
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                  Content-Length: 2\r\nConnection: close\r\n\r\n{}",
+                            );
+                            let _ = stream.flush();
+                        }
+                        // Hold the connection open forever: park, keeping the
+                        // stream alive. Dropping it would send EOF and the
+                        // client would return promptly — the opposite of the
+                        // situation under test.
+                        None => loop {
+                            std::thread::sleep(Duration::from_secs(3600));
+                        },
+                    }
+                });
+            }
+        });
+        base
+    }
+
+    type Call = (&'static str, fn(&str), Duration);
+
+    /// Every call in this file, paired with the budget it is meant to honour.
+    /// `init_cli_login` is included so the interactive budget is covered by the
+    /// same two claims as the rest.
+    fn calls() -> Vec<Call> {
+        vec![
+            (
+                "init_cli_login",
+                |b| {
+                    let _ = PlatformClient::init_cli_login(b, "v", "os");
+                },
+                PlatformClient::BUDGET_INTERACTIVE,
+            ),
+            (
+                "login",
+                |b| {
+                    let _ = PlatformClient::login(b, "e@x.test", "p");
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+            (
+                "start_cli_login",
+                |b| {
+                    let _ = PlatformClient::start_cli_login(b, "e@x.test", "v", "os");
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+            (
+                "poll_cli_login",
+                |b| {
+                    let _ = PlatformClient::poll_cli_login(b, "s", "d");
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+            (
+                "exchange_login_token",
+                |b| {
+                    let _ = PlatformClient::exchange_login_token(b, "s", "t");
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+            (
+                "do_refresh_token",
+                |b| {
+                    let _ = PlatformClient::do_refresh_token(b, "rt");
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+            (
+                "register_digital_employee",
+                |b| {
+                    let _ = PlatformClient::register_digital_employee(b, "jt", "host", "name");
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+            (
+                "get_all_keys",
+                |b| {
+                    let _ = PlatformClient::new(b, "jwt").get_all_keys();
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+            (
+                "resolve_cluster_node",
+                |b| {
+                    let _ = PlatformClient::new(b, "jwt").resolve_cluster_node();
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+            (
+                "get_key_delivery",
+                |b| {
+                    let _ = PlatformClient::new(b, "jwt").get_key_delivery("vk");
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+            (
+                "claim_key",
+                |b| {
+                    let _ = PlatformClient::new(b, "jwt").claim_key("vk");
+                },
+                PlatformClient::BUDGET_STANDARD,
+            ),
+        ]
+    }
+
+    /// Runs every call against `base` in parallel and reports how long each
+    /// took. Calls that have not returned by `deadline` are reported as
+    /// unbounded rather than hanging the test run.
+    fn run_all(base: &str, deadline: Duration) -> (Vec<(String, Duration)>, Vec<String>) {
+        let (tx, rx) = mpsc::channel();
+        let mut pending: Vec<String> = Vec::new();
+        for (name, f, _) in calls() {
+            pending.push(name.to_string());
+            let tx = tx.clone();
+            let base = base.to_string();
+            // Detached on purpose: a thread stuck in an unbounded call cannot be
+            // joined, and the whole point is to report that instead of hanging.
+            std::thread::spawn(move || {
+                let t0 = Instant::now();
+                f(&base);
+                let _ = tx.send((name.to_string(), t0.elapsed()));
+            });
+        }
+        drop(tx);
+        let started = Instant::now();
+        let mut done = Vec::new();
+        while !pending.is_empty() {
+            let left = deadline.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(left) {
+                Ok((name, took)) => {
+                    pending.retain(|p| p != &name);
+                    done.push((name, took));
+                }
+                Err(_) => break,
+            }
+        }
+        (done, pending)
+    }
+
+    #[test]
+    fn slow_but_alive_master_still_succeeds() {
+        let base = spawn(Some(SLOW_REPLY));
+        let budgets = calls();
+        let (done, never_returned) = run_all(&base, Duration::from_secs(60));
+        assert!(
+            never_returned.is_empty(),
+            "these calls never came back against a server that DID answer in {:?}: {:?}",
+            SLOW_REPLY,
+            never_returned
+        );
+        for (name, took) in done {
+            let budget = budgets
+                .iter()
+                .find(|(n, _, _)| *n == name)
+                .map(|(_, _, b)| *b)
+                .expect("known call");
+            // The load-bearing assertion: a call that returned EARLIER than the
+            // server's reply cannot have completed the round trip — it timed
+            // out. That is the "budget too small" regression.
+            assert!(
+                took >= SLOW_REPLY,
+                "{name} returned in {took:?}, before the server replied at {SLOW_REPLY:?} — \
+                 its budget ({budget:?}) is too small, so a slow-but-alive master now looks \
+                 unreachable. That is a worse bug than the unbounded wait this fence guards."
+            );
+            assert!(
+                took < budget,
+                "{name} took {took:?}, over its own {budget:?} budget on a healthy server"
+            );
+        }
+    }
+
+    #[test]
+    fn hung_master_does_not_hang_the_cli() {
+        let base = spawn(None);
+        let budgets = calls();
+        let longest = budgets.iter().map(|(_, _, b)| *b).max().expect("non-empty");
+        let (done, never_returned) = run_all(&base, longest + MARGIN);
+        assert!(
+            never_returned.is_empty(),
+            "control-plane call(s) still unbounded against a master that accepts the \
+             connection and never answers: {:?}\n\
+             This is the 2026-09-04 winpc2 shape — the CLI waits on the OS retry \
+             budget while the UI tells the user something is happening. Give each \
+             one a budget (PlatformClient::BUDGET_STANDARD / BUDGET_INTERACTIVE).",
+            never_returned
+        );
+        for (name, took) in done {
+            let budget = budgets
+                .iter()
+                .find(|(n, _, _)| *n == name)
+                .map(|(_, _, b)| *b)
+                .expect("known call");
+            assert!(
+                took <= budget + MARGIN,
+                "{name} took {took:?} against a hung server, past its {budget:?} budget"
+            );
+        }
     }
 }

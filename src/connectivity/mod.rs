@@ -121,6 +121,32 @@ impl CredentialKind {
 /// `base_url` is either the real provider URL (PersonalApi) or
 /// `http://127.0.0.1:<proxy_port>/<prefix>` (ManagedTeam / OAuth). The
 /// factories decide — runners do not.
+/// Where the credential under test lives — the single source of truth for
+/// whether the proxy may be asked to resolve the upstream by reference.
+///
+/// Why this exists (bugfix 2026-09-05-add-key-dialog-draft-probe-sends-
+/// unresolvable-source-ref): the 2026-08-04 change made `/admin/probe/ping`
+/// resolve the real upstream from `source_ref` and *refuse* when the ref is
+/// not in the vault (no silent fallback to the public host). That is right
+/// for a stored key. But the Add-Key dialog probes a **draft** — plaintext
+/// that is not saved yet — and its `source_ref` is only a display label
+/// (`add-key-openai`). Sending it made the proxy refuse every pre-save probe
+/// while the post-save probe (a real alias) passed. The gate used to be
+/// "kind == PersonalApi", which cannot tell a draft from a stored key; this
+/// enum can.
+///
+/// Rule: only `Stored` + `PersonalApi` targets hand their `source_ref` to
+/// the proxy for resolution (see [`TestTarget::resolvable_ref`]). Drafts
+/// always carry their own `base_url` and never a ref.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeSubject {
+    /// The credential is persisted in the vault under `source_ref`.
+    Stored,
+    /// Pre-save plaintext (Add-Key dialog / `aikey add` pre-flight). The
+    /// `source_ref` is a label, not a vault key.
+    Draft,
+}
+
 #[derive(Clone, Debug)]
 pub struct TestTarget {
     pub provider_code: String,
@@ -130,6 +156,9 @@ pub struct TestTarget {
     pub base_url: String,
     pub bearer: String,
     pub kind: CredentialKind,
+    /// Stored vs draft — decides whether `source_ref` may be sent to the
+    /// proxy for upstream resolution. See [`ProbeSubject`].
+    pub subject: ProbeSubject,
     /// Reference to the source row: vault alias, virtual_key_id, or
     /// provider_account_id. Used for JSON payloads, error messages, and the
     /// proxy probe sentinel/bearer construction. **Never** mutated to a
@@ -167,6 +196,27 @@ fn target_axes(raw_provider: &str, explicit_protocol: &str) -> (String, String, 
 }
 
 impl TestTarget {
+    /// The reference the proxy may resolve to the REAL upstream via
+    /// `/admin/probe/ping {source_ref}` — or `""` when the proxy must use
+    /// the caller-supplied `base_url` instead.
+    ///
+    /// This is the ONE place that decides. Runners pass the return value
+    /// through untouched; do not re-derive it from `kind` anywhere else
+    /// (that split is exactly how drafts got refused — see [`ProbeSubject`]).
+    ///
+    /// - `Stored` + `PersonalApi` → the vault alias (proxy resolves the
+    ///   entry's own base_url override; refuses if the alias is unknown).
+    /// - `Draft` → `""` (nothing to resolve; the draft's base_url IS the
+    ///   target).
+    /// - `ManagedTeam` / `OAuth` → `""` (their target is the local proxy
+    ///   prefix; resolution happens inside the proxy's own routing).
+    pub fn resolvable_ref(&self) -> &str {
+        match (self.subject, self.kind) {
+            (ProbeSubject::Stored, CredentialKind::PersonalApi) => &self.source_ref,
+            _ => "",
+        }
+    }
+
     /// Protocol/client-route label for the connectivity table. When the
     /// upstream supplier differs from the native route, keep it as an
     /// explicit `via` qualifier instead of presenting it as a protocol.
@@ -232,6 +282,7 @@ pub fn personal_target(
         base_url: format!("http://127.0.0.1:{}/{}", proxy_port, prefix),
         bearer: format!("aikey_probe_{}", source_ref),
         kind: CredentialKind::PersonalApi,
+        subject: ProbeSubject::Stored,
         source_ref: source_ref.to_string(),
         display_alias: String::new(), // personal: alias == source_ref, no separate label needed
     }
@@ -248,8 +299,12 @@ pub fn personal_target_direct(
     base_url_override: Option<&str>,
 ) -> TestTarget {
     let (provider, protocol, client_route, probe_provider) = target_axes(provider_code, "");
+    // Same normalisation the add path applies before storing, so the draft
+    // probe tests the URL that WILL be saved (bare host → `/v1` for
+    // /v1-rooted providers). See `crate::credential_input`.
     let base_url = base_url_override
-        .map(str::to_string)
+        .map(|u| crate::credential_input::normalize_base_url(&provider, u))
+        .filter(|u| !u.is_empty())
         .or_else(|| default_base_url(&provider).map(str::to_string))
         .unwrap_or_else(|| "https://unknown".to_string());
     TestTarget {
@@ -260,6 +315,9 @@ pub fn personal_target_direct(
         base_url,
         bearer: plaintext.trim().to_string(),
         kind: CredentialKind::PersonalApi,
+        // A draft is not in the vault: its source_ref is a label only and
+        // must never be sent to the proxy for resolution.
+        subject: ProbeSubject::Draft,
         source_ref: source_ref.to_string(),
         display_alias: String::new(), // personal: alias == source_ref, no separate label needed
     }
@@ -292,6 +350,7 @@ pub fn team_target(
         base_url: format!("http://127.0.0.1:{}/{}", proxy_port, prefix),
         bearer,
         kind: CredentialKind::ManagedTeam,
+        subject: ProbeSubject::Stored,
         source_ref: virtual_key_id.to_string(),
         display_alias: String::new(), // populated by callers that have access to the alias row
     }
@@ -330,6 +389,7 @@ pub fn team_target_cluster(
         base_url: format!("http://{}/{}", node_authority, prefix),
         bearer: token.to_string(),
         kind: CredentialKind::ManagedTeam,
+        subject: ProbeSubject::Stored,
         source_ref: virtual_key_id.to_string(),
         display_alias: String::new(), // populated by callers that have the alias row
     }
@@ -363,6 +423,7 @@ pub fn oauth_target(
         base_url: format!("http://127.0.0.1:{}/{}", proxy_port, prefix),
         bearer: format!("aikey_probe_{}", account_id),
         kind: CredentialKind::OAuth,
+        subject: ProbeSubject::Stored,
         source_ref: account_id.to_string(),
         display_alias: String::new(), // populated by callers (email / local_alias / display_identity)
     }
@@ -551,6 +612,7 @@ mod connectivity_suite_tests {
             base_url: "https://api.kimi.com/coding/v1".into(),
             bearer: "sk-redacted".into(),
             kind: CredentialKind::PersonalApi,
+            subject: ProbeSubject::Stored,
             source_ref: "kimi-local".into(),
             display_alias: String::new(),
         };
@@ -562,15 +624,95 @@ mod connectivity_suite_tests {
 
         let team = TestTarget {
             kind: CredentialKind::ManagedTeam,
+            subject: ProbeSubject::Stored,
             ..personal.clone()
         };
         assert_eq!(team.display_label(), "kimi (team)");
 
         let oauth = TestTarget {
             kind: CredentialKind::OAuth,
+            subject: ProbeSubject::Stored,
             ..personal.clone()
         };
         assert_eq!(oauth.display_label(), "kimi (oauth)");
+    }
+
+    // ── ProbeSubject / resolvable_ref ────────────────────────────────────
+    //
+    // Fence for bugfix 2026-09-05-add-key-dialog-draft-probe-sends-
+    // unresolvable-source-ref.md. The invariant is about the CONCEPT (who
+    // may be resolved by reference), so it is pinned on the single decider
+    // `TestTarget::resolvable_ref`, not on any one runner call site.
+
+    #[test]
+    fn draft_target_never_exposes_a_resolvable_ref() {
+        let t = personal_target_direct("add-key-openai", "sk-draft", "openai", None);
+        assert_eq!(t.subject, ProbeSubject::Draft);
+        assert_eq!(t.kind, CredentialKind::PersonalApi);
+        assert_eq!(
+            t.resolvable_ref(),
+            "",
+            "a draft is not in the vault: sending its label as source_ref makes the \
+             proxy refuse (PROBE_UPSTREAM_UNRESOLVED) — the Add-Key dialog bug"
+        );
+        assert_eq!(
+            t.source_ref, "add-key-openai",
+            "the label is kept for display/JSON"
+        );
+    }
+
+    #[test]
+    fn stored_personal_target_resolves_by_alias() {
+        let t = personal_target("my-openai", "openai", "", 27200);
+        assert_eq!(t.subject, ProbeSubject::Stored);
+        assert_eq!(t.resolvable_ref(), "my-openai");
+    }
+
+    #[test]
+    fn team_and_oauth_targets_never_resolve_by_ref() {
+        let team = team_target("vk-123", "openai", "", 27200);
+        assert_eq!(team.subject, ProbeSubject::Stored);
+        assert_eq!(
+            team.resolvable_ref(),
+            "",
+            "team probes target the local proxy prefix"
+        );
+        let personal = personal_target("alias", "openai", "", 27200);
+        let oauth = TestTarget {
+            kind: CredentialKind::OAuth,
+            ..personal.clone()
+        };
+        assert_eq!(oauth.resolvable_ref(), "");
+        // Belt and braces: a Draft is "" for every kind, not just PersonalApi.
+        let draft_team = TestTarget {
+            subject: ProbeSubject::Draft,
+            ..team.clone()
+        };
+        assert_eq!(draft_team.resolvable_ref(), "");
+    }
+
+    #[test]
+    fn draft_target_normalizes_bare_host_like_the_add_path() {
+        // The pre-save probe must test the URL that WILL be stored.
+        let t = personal_target_direct(
+            "add-key-openai",
+            "sk",
+            "openai",
+            Some("https://pingtoken.ai"),
+        );
+        assert_eq!(t.base_url, "https://pingtoken.ai/v1");
+        let t = personal_target_direct(
+            "add-key-openai",
+            "sk",
+            "openai",
+            Some("https://pingtoken.ai/v1/"),
+        );
+        assert_eq!(t.base_url, "https://pingtoken.ai/v1");
+        let t = personal_target_direct("a", "sk", "anthropic", Some("https://gw.example"));
+        assert_eq!(
+            t.base_url, "https://gw.example",
+            "non-/v1-rooted providers are untouched"
+        );
     }
 
     // ── targets_from_new_personal_key ────────────────────────────────────
@@ -975,6 +1117,8 @@ mod connectivity_suite_tests {
             chat_skip_reason: None,
             chat_body_snippet: None,
             models_seen: Vec::new(),
+            ping_error_code: None,
+            ping_warning: None,
         };
         // Ping(DIRECT) must not participate in success bookkeeping —
         // it's informational only. Main overall-success logic keys on API.
@@ -1005,6 +1149,8 @@ mod connectivity_suite_tests {
             chat_skip_reason: None,
             chat_body_snippet: None,
             models_seen: Vec::new(),
+            ping_error_code: None,
+            ping_warning: None,
         };
         assert!(
             r.ping_direct_ok && !r.ping_ok,

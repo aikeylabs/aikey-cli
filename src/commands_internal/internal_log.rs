@@ -145,7 +145,7 @@ where
     }
 }
 
-fn iso_now() -> String {
+pub(crate) fn iso_now() -> String {
     // Produce a stable ISO-8601 UTC timestamp without pulling in chrono.
     // Matches current.jsonl format closely enough for grep/jq.
     let d = SystemTime::now()

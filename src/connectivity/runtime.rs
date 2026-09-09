@@ -97,6 +97,18 @@ pub struct ConnectivityResult {
     /// benign-404 allowlist above is exactly those), and callers must render
     /// the difference rather than printing an authoritative empty set.
     pub models_seen: Vec<String>,
+    /// Machine-readable reason when the proxy ping phase failed, echoed from
+    /// `/admin/probe/ping {error_code}` (e.g. `PROBE_UPSTREAM_UNRESOLVED`).
+    /// `None` on success, on transport failure, or with a proxy older than
+    /// the field. Lets `aggregate_test_outcome` tell "the upstream is down"
+    /// apart from "the proxy could not resolve which upstream to dial".
+    pub ping_error_code: Option<String>,
+    /// Non-fatal skew notice: we asked the proxy to resolve a stored alias
+    /// but it did not echo `resolved_upstream` — the proxy predates the
+    /// 2026-08-04 resolution contract and tested our GUESS instead. The
+    /// verdict is kept (not failed) but the divergence must stay visible
+    /// (「展示=执行」).
+    pub ping_warning: Option<String>,
 }
 
 /// Default base URLs for known providers — always use the official recommended URL.
@@ -518,11 +530,15 @@ where
     // OAuth ref would make the proxy refuse (it fails loudly by design rather
     // than guessing), turning a working probe red — so the gate stays here
     // until the resolver covers those kinds.
-    let resolvable_ref = if matches!(kind, CredentialKind::PersonalApi) {
-        source_ref
-    } else {
-        ""
-    };
+    // `source_ref` here is already the RESOLVABLE ref — callers derive it
+    // from `TestTarget::resolvable_ref()`, which is the only place that
+    // decides whether a credential may be resolved by reference (stored
+    // personal key) or must be probed by its own base_url (draft, team,
+    // oauth). No re-derivation from `kind` here: a kind-only gate cannot
+    // tell a draft from a stored key and refused every Add-Key pre-save
+    // probe (bugfix 2026-09-05-add-key-dialog-draft-probe-sends-
+    // unresolvable-source-ref.md).
+    let resolvable_ref = source_ref;
 
     // Cumulative result that grows as each phase completes. We pass `&result`
     // back through the `Finished` callback so renderers can format the cell
@@ -540,10 +556,19 @@ where
     // side by side as "proxy path" vs "laptop path" was comparing nothing.
     // Display order of the columns is unchanged.
     on_phase(ProbePhase::PingProxy, ProbeStage::Started);
-    let (ping_ok, ping_ms, resolved_upstream) =
-        probe_via_aikey_proxy_ping(provider_code, &guessed_ping_url, resolvable_ref);
+    let ping = probe_via_aikey_proxy_ping(provider_code, &guessed_ping_url, resolvable_ref);
+    let (ping_ok, ping_ms, resolved_upstream) = (ping.ok, ping.ms, ping.resolved_upstream);
     result.ping_ok = ping_ok;
     result.ping_ms = ping_ms;
+    result.ping_error_code = ping.error_code.clone();
+    if ping_ok && !resolvable_ref.is_empty() && resolved_upstream.is_empty() {
+        result.ping_warning = Some(format!(
+            "aikey-proxy did not echo resolved_upstream for '{}': it predates the \
+             upstream-resolution contract (2026-08-04) and pinged the guessed \
+             address {} instead of the credential's own base_url — upgrade the proxy",
+            resolvable_ref, guessed_ping_url
+        ));
+    }
     on_phase(ProbePhase::PingProxy, ProbeStage::Finished(&result));
 
     // The address the proxy actually dialled wins; the guess is the fallback.
@@ -585,7 +610,10 @@ where
         on_phase(ProbePhase::Api, ProbeStage::Finished(&result));
         on_phase(ProbePhase::Chat, ProbeStage::Started);
         result.chat_skipped = true;
-        result.chat_skip_reason = Some("skipped because proxy ping failed".to_string());
+        result.chat_skip_reason = Some(match ping.error_code.as_deref() {
+            Some(code) => format!("skipped because proxy ping failed ({})", code),
+            None => "skipped because proxy ping failed".to_string(),
+        });
         on_phase(ProbePhase::Chat, ProbeStage::Finished(&result));
         return result;
     }
@@ -684,13 +712,34 @@ where
         match api_result {
             Ok(r) => {
                 let s = r.status();
+                let content_type = r.header("Content-Type").unwrap_or("").to_string();
                 let full = r.into_string().ok();
-                // 🔴 Parsed BEFORE truncation. The snippet is capped at ~512
-                // chars to keep the result cheap to clone, and a model list
-                // is routinely longer than that — reading the ids off the
-                // truncated copy would silently return the first three.
-                result.models_seen = full.as_deref().map(parse_model_ids).unwrap_or_default();
-                (true, Some(s), full.map(truncate_body_snippet))
+                // A 2xx that carries a web page is NOT a working API. The
+                // classic cause is a base_url pointing at a site's SPA
+                // (`https://gateway.example` instead of `.../v1`): the SPA
+                // catch-all answers 200 + HTML for `/models`, and treating
+                // that as a pass let a broken key show green while every
+                // real request failed (bugfix 2026-09-05-add-key-dialog-
+                // draft-probe-sends-unresolvable-source-ref.md, part D).
+                if body_is_html(&content_type, full.as_deref()) {
+                    (
+                        false,
+                        Some(s),
+                        Some(format!(
+                            "upstream answered HTTP {} with an HTML page, not a JSON API \
+                             response — base_url probably points at a website, not the \
+                             API root (OpenAI-compatible gateways usually need a /v1 suffix)",
+                            s
+                        )),
+                    )
+                } else {
+                    // 🔴 Parsed BEFORE truncation. The snippet is capped at ~512
+                    // chars to keep the result cheap to clone, and a model list
+                    // is routinely longer than that — reading the ids off the
+                    // truncated copy would silently return the first three.
+                    result.models_seen = full.as_deref().map(parse_model_ids).unwrap_or_default();
+                    (true, Some(s), full.map(truncate_body_snippet))
+                }
             }
             Err(ureq::Error::Status(code, response)) => {
                 let body = response.into_string().ok().map(truncate_body_snippet);
@@ -821,11 +870,22 @@ fn probe_http_head_direct(target_url: &str, timeout: std::time::Duration) -> (bo
 ///
 /// Returns `(false, elapsed_ms)` on any transport error, unknown provider,
 /// or aikey-proxy unreachability. Short-circuits the rest of the suite.
+/// Outcome of `/admin/probe/ping`. `error_code` is the proxy's stable
+/// reason on `ok:false` (empty → `None`): the CLI must not parse the human
+/// `error` text to classify failures.
+#[derive(Debug, Default)]
+struct ProxyPingOutcome {
+    ok: bool,
+    ms: u128,
+    resolved_upstream: String,
+    error_code: Option<String>,
+}
+
 fn probe_via_aikey_proxy_ping(
     provider_code: &str,
     upstream_url: &str,
     source_ref: &str,
-) -> (bool, u128, String) {
+) -> ProxyPingOutcome {
     use std::time::Instant;
     let proxy_port = crate::commands_proxy::proxy_port();
     let endpoint = format!("http://127.0.0.1:{}/admin/probe/ping", proxy_port);
@@ -858,13 +918,23 @@ fn probe_via_aikey_proxy_ping(
         .send_string(&body.to_string())
     {
         Ok(r) => r,
-        Err(_) => return (false, start.elapsed().as_millis(), String::new()),
+        Err(_) => {
+            return ProxyPingOutcome {
+                ms: start.elapsed().as_millis(),
+                ..Default::default()
+            }
+        }
     };
     // Proxy always returns 200 with a structured JSON body — even on
     // upstream failure. If the proxy says ok:false, we propagate that.
     let parsed: serde_json::Value = match resp.into_json() {
         Ok(v) => v,
-        Err(_) => return (false, start.elapsed().as_millis(), String::new()),
+        Err(_) => {
+            return ProxyPingOutcome {
+                ms: start.elapsed().as_millis(),
+                ..Default::default()
+            }
+        }
     };
     let proxy_ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     let proxy_ms = parsed
@@ -880,9 +950,19 @@ fn probe_via_aikey_proxy_ping(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let error_code = parsed
+        .get("error_code")
+        .and_then(|v| v.as_str())
+        .filter(|c| !c.is_empty())
+        .map(str::to_string);
     // Report proxy's own measured latency (host → upstream), not our RTT
     // to localhost (which is ~0ms and meaningless).
-    (proxy_ok, proxy_ms, resolved)
+    ProxyPingOutcome {
+        ok: proxy_ok,
+        ms: proxy_ms,
+        resolved_upstream: resolved,
+        error_code,
+    }
 }
 
 /// Result of a proxy connectivity probe.
@@ -1201,6 +1281,29 @@ pub fn proxy_probe_full_hint(r: &ProxyProbeResult) -> String {
 /// providers (e.g. Anthropic) keep the normal GET probe.
 fn is_responses_only_backend(provider_code: &str, kind: CredentialKind) -> bool {
     provider_code == "openai" && matches!(kind, CredentialKind::OAuth)
+}
+
+/// True when a response is a web page rather than an API payload: either the
+/// server says so (`text/html`) or the body starts like a document
+/// (`<!doctype` / `<html`). Content-type alone is not enough — some SPA hosts
+/// mislabel, and some gateways answer HTML with no content-type at all.
+fn body_is_html(content_type: &str, body: Option<&str>) -> bool {
+    if content_type
+        .split(';')
+        .next()
+        .map(|t| t.trim().eq_ignore_ascii_case("text/html"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let head: String = body
+        .unwrap_or("")
+        .trim_start()
+        .chars()
+        .take(16)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    head.starts_with("<!doctype") || head.starts_with("<html")
 }
 
 fn probe_suffix(provider_code: &str, base_url: &str) -> String {
@@ -1639,7 +1742,7 @@ pub fn run_connectivity_suite(
                 &t.base_url,
                 &t.bearer,
                 t.kind,
-                &t.source_ref,
+                t.resolvable_ref(),
             );
             if r.chat_ok || (r.chat_skipped && r.api_ok) {
                 any_chat_ok = true;
@@ -1682,6 +1785,8 @@ pub fn run_connectivity_suite(
                 "chat_status":        r.chat_status,
                 "chat_skipped":       r.chat_skipped,
                 "chat_skip_reason":   r.chat_skip_reason.as_deref(),
+                "ping_error_code":    r.ping_error_code.as_deref(),
+                "ping_warning":       r.ping_warning.as_deref(),
                 "chat_body_snippet":  trunc(&r.chat_body_snippet),
             }));
             rows.push((t.clone(), r));
@@ -1992,7 +2097,9 @@ pub fn run_connectivity_suite(
         let base_url = t.base_url.clone();
         let bearer = t.bearer.clone();
         let kind = t.kind;
-        let source_ref = t.source_ref.clone();
+        // Only the resolvable form crosses into the runner — see
+        // `TestTarget::resolvable_ref` for why drafts/team/oauth pass "".
+        let source_ref = t.resolvable_ref().to_string();
         let r = animate_blinking_while(
             &[W_PD, W_PING, W_API, W_CHAT_ANIM],
             format_cell,
@@ -3411,6 +3518,190 @@ mod probe_raw_error_classification_tests {
             r.status,
             Some(200),
             "None mode (post-save) must NOT extract upstream_status — would change UX of 5 post-save call sites silently"
+        );
+    }
+
+    /// Fence (bugfix 2026-09-05-…, part D): an API probe that gets a web
+    /// page back is a FAIL, whatever the status code says.
+    #[test]
+    fn html_answers_are_detected_by_header_or_body() {
+        use super::body_is_html;
+        assert!(body_is_html("text/html; charset=utf-8", Some("{}")));
+        assert!(body_is_html("TEXT/HTML", None));
+        assert!(body_is_html("", Some("  <!DOCTYPE html><html>")));
+        assert!(body_is_html(
+            "application/octet-stream",
+            Some("<html lang=en>")
+        ));
+        assert!(!body_is_html("application/json", Some("{\"data\":[]}")));
+        assert!(!body_is_html("", Some("{\"object\":\"list\"}")));
+        assert!(!body_is_html("", None));
+    }
+
+    /// Wire-contract fence for bugfix 2026-09-05-add-key-dialog-draft-probe-
+    /// sends-unresolvable-source-ref.md: what actually reaches
+    /// `/admin/probe/ping` for a DRAFT target must carry `base_url` and NO
+    /// `source_ref`; for a STORED personal target it must carry `source_ref`.
+    /// Runs the real runner (`test_provider_connectivity_with_progress`) with
+    /// the ref derived the way both suite call sites derive it —
+    /// `TestTarget::resolvable_ref()` — against a local capture server that
+    /// stands in for the proxy.
+    #[test]
+    fn ping_body_carries_source_ref_only_for_stored_personal_targets() {
+        use super::test_provider_connectivity_with_progress;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Minimal HTTP/1.1 server: records every request body, answers a
+        // proxy-shaped ping response (also acceptable as an API body).
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let bodies: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&bodies);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let (mut head_end, mut content_len) = (None, 0usize);
+                loop {
+                    let n = match stream.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&tmp[..n]);
+                    if head_end.is_none() {
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            head_end = Some(p + 4);
+                            let head = String::from_utf8_lossy(&buf[..p]).to_string();
+                            content_len = head
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    k.trim()
+                                        .eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse::<usize>().ok())?
+                                })
+                                .unwrap_or(0);
+                        }
+                    }
+                    if let Some(h) = head_end {
+                        if buf.len() >= h + content_len {
+                            break;
+                        }
+                    }
+                }
+                let h = head_end.unwrap_or(buf.len());
+                let head = String::from_utf8_lossy(&buf[..h]).to_string();
+                let body = String::from_utf8_lossy(&buf[h..]).to_string();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                sink.lock().unwrap().push((path, body));
+                let resp_body = r#"{"ok":true,"latency_ms":1,"resolved_upstream":"http://resolved.example/v1","object":"list","data":[]}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+            }
+        });
+
+        // `proxy_port()` prefers the RUNNING proxy's runtime snapshot over
+        // AIKEY_PROXY_PORT, so point the run dir at an empty tempdir first —
+        // otherwise a developer's live proxy would receive the ping.
+        let run_dir = tempfile::tempdir().expect("tempdir");
+        let prev_run = std::env::var("AIKEY_RUN_DIR").ok();
+        let prev = std::env::var("AIKEY_PROXY_PORT").ok();
+        std::env::set_var("AIKEY_RUN_DIR", run_dir.path());
+        std::env::set_var("AIKEY_PROXY_PORT", port.to_string());
+        let restore = || {
+            match &prev {
+                Some(v) => std::env::set_var("AIKEY_PROXY_PORT", v),
+                None => std::env::remove_var("AIKEY_PROXY_PORT"),
+            }
+            match &prev_run {
+                Some(v) => std::env::set_var("AIKEY_RUN_DIR", v),
+                None => std::env::remove_var("AIKEY_RUN_DIR"),
+            }
+        };
+
+        let ping_bodies = |bodies: &Arc<Mutex<Vec<(String, String)>>>| -> Vec<serde_json::Value> {
+            bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(p, _)| p == "/admin/probe/ping")
+                .map(|(_, b)| serde_json::from_str(b).expect("ping body is JSON"))
+                .collect()
+        };
+
+        // Draft (Add-Key dialog pre-save probe): its base_url is the capture
+        // server itself, so every phase stays local.
+        let draft = crate::connectivity::personal_target_direct(
+            "add-key-openai",
+            "sk-draft",
+            "openai",
+            Some(&format!("http://127.0.0.1:{}/v1", port)),
+        );
+        let _ = test_provider_connectivity_with_progress(
+            &draft.probe_provider_code,
+            &draft.base_url,
+            &draft.bearer,
+            draft.kind,
+            draft.resolvable_ref(),
+            |_, _| {},
+        );
+        let pings = ping_bodies(&bodies);
+        assert_eq!(pings.len(), 1, "exactly one ping for the draft");
+        assert!(
+            pings[0].get("source_ref").is_none(),
+            "draft ping must not send source_ref (proxy would refuse it): {}",
+            pings[0]
+        );
+        // The body must carry an address for the proxy to dial. (Not pinned
+        // to the capture server's URL: the runner still maps a
+        // 127.0.0.1/localhost base_url to the provider default — pre-existing
+        // "stored key → local proxy prefix" heuristic, P2 in the bugfix doc.)
+        assert!(
+            !pings[0]
+                .get("base_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .is_empty(),
+            "draft ping carries a base_url: {}",
+            pings[0]
+        );
+
+        // Stored personal key: the proxy resolves it by alias.
+        bodies.lock().unwrap().clear();
+        let stored = crate::connectivity::personal_target("my-openai", "openai", "", port);
+        let r = test_provider_connectivity_with_progress(
+            &stored.probe_provider_code,
+            &stored.base_url,
+            &stored.bearer,
+            stored.kind,
+            stored.resolvable_ref(),
+            |_, _| {},
+        );
+        restore();
+        let pings = ping_bodies(&bodies);
+        assert_eq!(pings.len(), 1, "exactly one ping for the stored key");
+        assert_eq!(
+            pings[0].get("source_ref").and_then(|v| v.as_str()),
+            Some("my-openai"),
+            "stored personal key is resolved by reference: {}",
+            pings[0]
+        );
+        assert!(
+            r.ping_warning.is_none(),
+            "proxy echoed resolved_upstream → no version-skew warning: {:?}",
+            r.ping_warning
         );
     }
 }

@@ -9,6 +9,7 @@ mod config;
 mod connectivity;
 #[allow(dead_code)]
 mod control_plane_error;
+mod credential_input;
 mod credential_type;
 mod crypto;
 #[allow(dead_code)]
@@ -4425,6 +4426,17 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("  {} {}", name, path.display().to_string().dimmed());
                         }
                     }
+                    // A config aikey cannot read is LISTED, not hidden (2026-09-05):
+                    // the guard refuses to touch it, so this is where a user learns
+                    // why `aikey use` stopped configuring the tool — and how to fix it.
+                    let unreadable = commands_account::unreadable_provider_configs();
+                    if !unreadable.is_empty() {
+                        eprintln!();
+                        eprintln!("{}", "Provider configs aikey cannot read:".bold());
+                        for (name, _path, sentence) in &unreadable {
+                            eprintln!("  {} {}", name, sentence.yellow());
+                        }
+                    }
                 }
                 Some(EnvAction::Set { args }) => {
                     // `aikey env set -- KEY=VALUE ...`
@@ -8262,6 +8274,28 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             }
         }
         HookAction::Reinstall { shell } => handle_hook_reinstall(shell.as_deref()),
+        HookAction::Repair {
+            target,
+            strip_ours,
+            from_backup,
+            yes,
+            json,
+        } => {
+            // `--from-backup` with no value = newest aikey backup.
+            let from_backup = from_backup.as_ref().map(|p| {
+                if p.is_empty() {
+                    None
+                } else {
+                    Some(std::path::PathBuf::from(p))
+                }
+            });
+            let code =
+                commands_account::hook_repair(target, *strip_ours, from_backup, *yes, *json)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         HookAction::Uninstall { target } => match target.as_deref() {
             Some("openclaw") => commands_account::openclaw_hook::uninstall().map_err(|e| e.into()),
             // 🔴 The per-tool reverse of `aikey hook install codex` (2026-08-18).
@@ -8283,8 +8317,19 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             // and `aikey hook install codex` remains the documented way back
             // (running it IS actionable consent, per the 2026-07-16 rule).
             Some("codex") => {
-                commands_account::unconfigure_codex_cli();
+                let outcome = commands_account::unconfigure_codex_cli();
                 global_config::set_codex_consent_never()?;
+                // The guard already printed WHY it refused (unparseable file…).
+                // Do not print a success line over it — that is how the
+                // 2026-09-04 incident stayed invisible. The preference still
+                // flips: the user asked for "never", and that part happened.
+                if outcome.refused() {
+                    eprintln!(
+                        "  Codex consent set to never, but its config was left as is (see above). \
+Run `aikey hook repair codex` to see how to fix the file."
+                    );
+                    std::process::exit(2);
+                }
                 eprintln!(
                     "  {} Codex takeover removed. Run `aikey hook install codex` to allow it again.",
                     crate::symbols::CHECK.s()
@@ -8395,7 +8440,8 @@ fn handle_hook_uninstall() -> Result<(), Box<dyn std::error::Error>> {
         // Even when nothing was wired, stale third-party CLI configs are
         // exactly as broken (no env channel) — reconcile them too.
         commands_account::reconcile_cli_configs_after_hook_uninstall();
-        commands_account::claude_desktop::restore_quiet();
+        // Claude Desktop is deliberately NOT restored here — see the note at
+        // the end of this function.
         return Ok(());
     }
     for t in &touched {
@@ -8425,14 +8471,31 @@ fn handle_hook_uninstall() -> Result<(), Box<dyn std::error::Error>> {
     // X8 (2026-07-12): codex/kimi configs that route through aikey only work
     // WITH the hook env — offer to strip them (TTY) or warn loudly (non-TTY).
     commands_account::reconcile_cli_configs_after_hook_uninstall();
-    // 阶段7 D8② (2026-07-13): Desktop is a persisted-file surface, not env-
-    // injected — left in 3p after hook uninstall it breaks silently once the
-    // proxy stops, with no diagnosable symptom in the GUI. Deliberate
-    // exception: bare `hook uninstall` also restores Desktop (soft-fail,
-    // proxy-independent; clears an `always` grant per D6 supplement).
-    // `hook uninstall openclaw` and `hook reinstall` never reach this
-    // handler — verified, no reinstall flip-flop.
-    commands_account::claude_desktop::restore_quiet();
+    // 🔴 Claude Desktop is NOT touched here (2026-09-04, reverses 阶段7 D8②).
+    //
+    // D8② made `hook uninstall` also restore Desktop to 1p. The reasoning was
+    // "Desktop left in 3p breaks silently once the proxy stops" — true, but it
+    // conflated two different events. Desktop is a persisted-file surface that
+    // talks to the proxy over HTTP; it never read the hook's env, so the hook
+    // being on or off has no bearing on whether Desktop works. Turning the
+    // shell hook off is a preference about terminals; undoing a takeover the
+    // user set up separately is a surprise, and it made the panel's Desktop
+    // toggle silently flip back whenever the hook was turned off.
+    //
+    // The case D8② was actually protecting against is UNINSTALL — there the
+    // proxy really does go away. So the restore now lives where that happens,
+    // by name, in both installers:
+    //   workflow/CD/installer/uninstall.sh   (`aikey desktop uninstall`)
+    //   workflow/CD/installer/uninstall.ps1  (Restore-ClaudeDesktop)
+    // The .ps1 side never had it at all, so this move also closes a Windows
+    // gap that existed for as long as D8② did.
+    //
+    // codex/kimi above are the opposite case and keep their reconcile: those
+    // configs route through aikey ONLY via the hook's env, so no hook means
+    // they are genuinely broken.
+    //
+    // 规则：workflow/CI/requirements/2026-07-10-claude-desktop-provider-switch.md
+    // 规则 10（取代规则 3 中的 `hook uninstall` 触发项）
     Ok(())
 }
 
