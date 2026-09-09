@@ -518,12 +518,18 @@ fn preview_body() -> String {
 #[test]
 fn the_preview_writes_nothing() {
     let body = preview_body();
+    // 🔴 These must name the write door as it is TODAY. `write_settings_atomic`
+    // and `backup_settings` were RETIRED on 2026-09-05 (settings.json moved
+    // behind `third_party_config`), and a list that bans names which no longer
+    // exist bans nothing — the fence would have gone vacuous while still
+    // reading green. See tests/third_party_write_guard_fence.rs.
     for banned in [
-        "write_settings_atomic",
+        "tp::apply",
+        "tp::commit",
         "fs::write",
         "File::create",
         "OpenOptions",
-        "backup_settings",
+        "backup_versioned",
     ] {
         assert!(
             !body.contains(banned),
@@ -611,3 +617,93 @@ fn the_whitelist_is_labelled_advisory_where_the_user_can_see_it() {
     );
 }
 
+// ─── the gate writes through the ONE door (Phase 3b, 2026-09-09) ─────────────
+// spec: R-third-party-config-guard-2.S1 产品代码不许有第二扇写门
+
+use crate::commands_account::tp_invalid_file_suite::Sandbox;
+use crate::commands_account::third_party_config as tp;
+
+// ── the MCP delegation gate shares this same file (Phase 3b, 2026-09-09) ──
+// spec: R-third-party-config-guard-2.S1 — one write door.
+//
+// 🔴 Written when `aikey mcp guard` was ported off `commands_statusline`'s
+// retired `read_settings` / `backup_settings` / `write_settings_atomic`.
+// The port is only half done if the hook lands but the guarantees the door
+// exists to provide do not: a versioned backup, never the retired
+// single-slot name, a third party's entry preserved, and an unparseable
+// file left alone. `TP_COMMITS` is the runtime witness that it really is
+// the door and not a second one that happens to produce the same bytes.
+
+#[test]
+fn mcp_guard_writes_through_the_one_door_and_leaves_the_statusline_alone() {
+    let event = crate::mcp_harness::default_adapter().hook_event();
+    let pre = format!(
+        "{{\n  \"statusLine\": {{ \"type\": \"command\", \"command\": \"/usr/local/bin/starship status\" }},\n  \"hooks\": {{ \"{event}\": [ {{ \"matcher\": \"Bash\", \"hooks\": [ {{ \"type\": \"command\", \"command\": \"/opt/other/tool\" }} ] }} ] }}\n}}"
+    );
+    let sb = Sandbox::with_claude(Some(&pre));
+    let commits = tp::TP_COMMITS.load(std::sync::atomic::Ordering::SeqCst);
+
+    cmd_install(true).unwrap();
+
+    assert_eq!(
+        tp::TP_COMMITS.load(std::sync::atomic::Ordering::SeqCst),
+        commits + 1,
+        "install went through third_party_config::commit exactly once"
+    );
+    assert_eq!(tp::list_backups(&sb.cfg).len(), 1, "one versioned backup");
+    assert!(
+        !sb.cfg.with_file_name("settings.aikey_backup.json").exists(),
+        "the retired single-slot backup name is never written again"
+    );
+
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&sb.cfg).unwrap()).unwrap();
+    let list = doc["hooks"][event].as_array().unwrap();
+    assert_eq!(list.len(), 2, "the third party's entry survived the merge");
+    assert!(list
+        .iter()
+        .any(|g| g["hooks"][0]["command"] == "/opt/other/tool"));
+    assert!(list.iter().any(|g| g["hooks"][0]["command"]
+        == serde_json::Value::String(hook_command())));
+    assert_eq!(
+        doc["statusLine"]["command"], "/usr/local/bin/starship status",
+        "the status line belongs to another feature and is not ours to touch"
+    );
+
+    // Idempotent: a second install is a byte no-op, so it must not commit.
+    cmd_install(true).unwrap();
+    assert_eq!(
+        tp::TP_COMMITS.load(std::sync::atomic::Ordering::SeqCst),
+        commits + 1
+    );
+
+    cmd_uninstall(true).unwrap();
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&sb.cfg).unwrap()).unwrap();
+    let list = doc["hooks"][event].as_array().unwrap();
+    assert_eq!(list.len(), 1, "uninstall took ours and only ours");
+    assert_eq!(list[0]["hooks"][0]["command"], "/opt/other/tool");
+    assert_eq!(doc["statusLine"]["command"], "/usr/local/bin/starship status");
+}
+
+#[test]
+fn mcp_guard_refuses_an_unparseable_settings_file_without_touching_it() {
+    let sb = Sandbox::with_claude(Some("{ \"hooks\": { "));
+    let before = std::fs::read(&sb.cfg).unwrap();
+    let commits = tp::TP_COMMITS.load(std::sync::atomic::Ordering::SeqCst);
+
+    cmd_install(true).unwrap();
+    cmd_uninstall(true).unwrap();
+
+    assert_eq!(
+        std::fs::read(&sb.cfg).unwrap(),
+        before,
+        "an unparseable settings.json is diagnosed, never rewritten"
+    );
+    assert_eq!(
+        tp::TP_COMMITS.load(std::sync::atomic::Ordering::SeqCst),
+        commits,
+        "a refusal must not reach the write door"
+    );
+    assert!(tp::list_backups(&sb.cfg).is_empty());
+}

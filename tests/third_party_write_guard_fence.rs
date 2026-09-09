@@ -43,6 +43,14 @@ const RATCHET: &[(&str, usize)] = &[
     ("src/commands_statusline.rs", 15), // statusline render cache / WAL (aikey's own files); claude settings on the guard
     ("src/commands_account/mod.rs", 12), // aikey's own file
     (GUARD, 5),                         // commit(write+delete) + backup copy + prune delete
+    // 🔴 Phase 3b (2026-09-09): `aikey mcp guard` writes the SAME
+    // ~/.claude/settings.json as the status line, so it is a third-party-config
+    // writer and belongs under the ratchet. Ceiling 0, not "the current count":
+    // it was ported onto `third_party_config::apply` with no writer of its own,
+    // and the point of listing it is that the FIRST raw write added here is the
+    // regression. It reached that state by going through the door; this stops it
+    // leaving by growing a second one.
+    ("src/mcp_guard.rs", 0),
 ];
 
 const WRITE_CALLS: &[&str] = &[

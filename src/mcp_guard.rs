@@ -26,8 +26,18 @@
 //!   - install backs up first, and writes atomically
 //!   - uninstall removes OUR entry only, and never touches `statusLine`
 //!
-//! All of that machinery already exists for the status line, and this module
-//! reuses it rather than growing a second copy (technical design §8.6).
+//! All of that machinery already exists, and this module reuses it rather than
+//! growing a second copy (technical design §8.6). Concretely: every read and
+//! every write below goes through `third_party_config` — the ONE write door
+//! (spec: R-third-party-config-guard-2.S1 产品代码不许有第二扇写门). This module
+//! contributes a `Surface`, not a writer.
+//!
+//! 🔴 It used to call `commands_statusline`'s own `read_settings` /
+//! `backup_settings` / `write_settings_atomic` instead. Those were RETIRED on
+//! 2026-09-05 when Claude's settings.json moved behind the guard, and
+//! `tests/third_party_write_guard_fence.rs` lists them in `GONE_FOR_GOOD`.
+//! 🚫 Do not reintroduce them here to save a few lines: a second write door is
+//! the exact defect that fence was written for.
 //!
 //! # Measured facts this module depends on (2026-09-03, Claude Code 2.1.247)
 //!
@@ -40,11 +50,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 
-use crate::commands_statusline::{
-    aikey_bin_quoted, backup_settings, claude_settings_path, read_settings, write_settings_atomic,
-    ReadError,
-};
+use crate::commands_account::third_party_config as tp;
+use crate::commands_statusline::{aikey_bin_quoted, claude_settings_path, parse_claude_settings};
 
 // 🔴 The hook event name and the matcher are the HARNESS's, not ours, so they
 // come from the adapter (P15 · K4 · task 15.23) rather than from constants here.
@@ -465,6 +474,135 @@ pub fn apply_uninstall(settings: &mut serde_json::Value) -> bool {
     true
 }
 
+// ─────────────────────────── the settings.json surface ───────────────────────
+
+/// The delegation hook's face to the one write door.
+///
+/// 🔴 It reports `SurfaceId::Claude` — the SAME id the status line reports —
+/// because that id names the TOOL whose file is being written (Claude Code's
+/// `settings.json`), not the concern doing the writing. Two concerns share this
+/// one file. A third id invented for the second concern would grow the
+/// serialized vocabulary that `SurfaceOutcome`, `status --json` and
+/// `hook repair --json` all carry, and would tell a reader the guard had
+/// touched some other file.
+pub struct McpGuardSurface;
+
+/// Where our hook stands in a parsed settings document.
+///
+/// 🔴 `Foreign` here means a SHAPE we cannot read (`hooks` is not an object,
+/// `hooks.<event>` is not an array) — NOT "somebody else holds the slot".
+/// `PreToolUse` is an additive list: a third party's entry there is normal and
+/// must survive. The unreadable shape is the only case we refuse on, and it is
+/// the same case `apply_install` reported as `RefusedForeignShape`.
+fn guard_state(doc: &serde_json::Value) -> tp::TpConfigState {
+    let Some(hooks) = doc.get("hooks") else {
+        return tp::TpConfigState::PresentNoAikey;
+    };
+    let Some(hooks) = hooks.as_object() else {
+        return tp::TpConfigState::Foreign {
+            owner: "hooks is not an object".into(),
+        };
+    };
+    let event = harness().hook_event();
+    let Some(list) = hooks.get(event) else {
+        return tp::TpConfigState::PresentNoAikey;
+    };
+    let Some(list) = list.as_array() else {
+        return tp::TpConfigState::Foreign {
+            owner: format!("hooks.{event} is not an array"),
+        };
+    };
+    match list.iter().find(|g| is_ours(g)) {
+        // Present, and identical to what we would write now.
+        Some(g) if *g == our_group() => tp::TpConfigState::OursActive,
+        // Present but stale — typically the binary moved. `OurResidue` still
+        // answers has_ours(), which is what lets uninstall strip it and what
+        // makes `status` say "registered" for a gate that really is registered.
+        Some(_) => tp::TpConfigState::OurResidue,
+        None => tp::TpConfigState::PresentNoAikey,
+    }
+}
+
+impl tp::Surface for McpGuardSurface {
+    type Doc = serde_json::Value;
+    /// Install takes no parameters: the hook command is derived from THIS
+    /// binary's own path, never chosen by the caller.
+    type Input = ();
+
+    const ID: tp::SurfaceId = tp::SurfaceId::Claude;
+    const FORMAT: tp::Format = tp::Format::Json;
+    // Never conjure ~/.claude on a machine that has never run Claude Code —
+    // the same rule the status-line installer follows, for the same reason.
+    const CREATE: tp::CreatePolicy = tp::CreatePolicy::RequireParentDir;
+    // See `guard_state`: there is no exclusive slot here, so there is nothing
+    // to claim and no consent to ask for.
+    const FOREIGN: tp::ForeignPolicy = tp::ForeignPolicy::NotApplicable;
+    // JSON: there is no line-level "ours" to strip; repair is --from-backup.
+    const OWNED_GRAMMAR: Option<&'static tp::OwnedTomlGrammar> = None;
+
+    fn path(&self) -> PathBuf {
+        claude_settings_path().unwrap_or_else(|| PathBuf::from("settings.json"))
+    }
+    fn load(&self, text: &str) -> Result<Self::Doc, tp::ParseFailure> {
+        // 🔴 The SAME parse the status line uses. Two surfaces disagreeing about
+        // what "parses" means would let one refuse a file the other just wrote.
+        parse_claude_settings(text)
+    }
+    fn empty_doc(&self) -> Self::Doc {
+        serde_json::json!({})
+    }
+    fn detect(&self, doc: &Self::Doc) -> tp::Detection {
+        tp::Detection::of(guard_state(doc))
+    }
+    fn refuse_merge(
+        &self,
+        det: &tp::Detection,
+        _input: &Self::Input,
+    ) -> Option<(tp::ReasonCode, tp::ReasonCtx)> {
+        match &det.state {
+            tp::TpConfigState::Foreign { owner } => Some((
+                tp::ReasonCode::TpConfigForeign,
+                tp::ReasonCtx {
+                    surface: Some(tp::SurfaceId::Claude),
+                    path_display: tp::display_for(&self.path()),
+                    format: Some(tp::Format::Json),
+                    owner: Some(owner.clone()),
+                    ..Default::default()
+                },
+            )),
+            _ => None,
+        }
+    }
+    fn merge(&self, mut doc: Self::Doc, _input: &Self::Input) -> Result<Self::Doc, String> {
+        // The pure core, unchanged. `RefusedForeignShape` is already caught by
+        // `refuse_merge` above; keeping the arm means a future shape the
+        // detector misses still fails loudly instead of writing something odd.
+        match apply_install(&mut doc) {
+            GuardAction::RefusedForeignShape => {
+                Err("settings.json has a hooks.PreToolUse of an unexpected shape".into())
+            }
+            _ => Ok(doc),
+        }
+    }
+    fn remove(&self, mut doc: Self::Doc) -> Self::Doc {
+        apply_uninstall(&mut doc);
+        doc
+    }
+    fn render(&self, doc: &Self::Doc) -> String {
+        // An empty object renders EMPTY, so the guard deletes a settings.json
+        // that holds nothing but what we just removed — it never looked like
+        // user state. Byte-identical to the status line's rule for this file;
+        // the two must agree, because they render the SAME document.
+        if doc.as_object().map(|o| o.is_empty()).unwrap_or(false) {
+            return String::new();
+        }
+        serde_json::to_string_pretty(doc).unwrap_or_default()
+    }
+    fn expected_after_merge(&self, det: &tp::Detection, _input: &Self::Input) -> bool {
+        det.state == tp::TpConfigState::OursActive
+    }
+}
+
 /// `aikey mcp guard install`
 pub fn cmd_install(json: bool) -> Result<(), String> {
     use colored::Colorize;
@@ -475,55 +613,42 @@ pub fn cmd_install(json: bool) -> Result<(), String> {
             "no Claude Code config directory on this machine",
         );
     };
-    // 🔴 Do not create `~/.claude` out of thin air. On a machine without Claude
-    // Code, conjuring its config directory is an overreach — the status-line
-    // installer already decided this and the reasoning is identical.
-    let Some(dir) = path.parent() else {
-        return say(json, "not-applicable", "settings path has no parent");
-    };
-    if !dir.exists() {
-        return say(
+
+    // 🔴 ONE call now does what this function used to spell out by hand: read,
+    // strict parse, detect, merge, verify the post-state, back up, then write
+    // atomically — and on every branch that can stop it stops WITHOUT touching
+    // the file. The branches are the same ones as before (no ~/.claude, an
+    // unparseable settings.json, a hooks shape we cannot read); they are just
+    // no longer a second implementation of them.
+    let out = tp::apply(&McpGuardSurface, tp::TpOp::Merge(()));
+
+    // The guard has already printed its sentence to stderr and logged the
+    // structured event, so the refusal paths owe only the --json envelope.
+    if matches!(out.reason_code, Some(tp::ReasonCode::TpNotApplicable)) {
+        return say_after_guard(
             json,
             "not-applicable",
-            "Claude Code config directory not found — open Claude Code once, then re-run",
+            out.sentence.as_deref().unwrap_or(
+                "Claude Code config directory not found — open Claude Code once, then re-run",
+            ),
         );
     }
-
-    let mut settings = match read_settings(&path) {
-        Ok(v) => v,
-        Err(ReadError::NotFound) => serde_json::json!({}),
-        // 🔴 A settings file we cannot parse is LEFT ALONE. Rewriting it would
-        // discard whatever the user has in there, and "your editor config
-        // vanished" is not an acceptable cost for installing a hook.
-        Err(ReadError::Malformed(e)) => {
-            return say(
-                json,
-                "refused",
-                &format!("settings.json does not parse ({e}); refusing to touch it"),
-            )
-        }
-        Err(ReadError::Io(e)) => return Err(format!("cannot read {}: {e}", path.display())),
-    };
-
-    let action = apply_install(&mut settings);
-    if action == GuardAction::RefusedForeignShape {
-        return say(
+    if matches!(out.action, tp::TpAction::Refused | tp::TpAction::Failed) {
+        return say_after_guard(
             json,
             "refused",
-            "settings.json has a hooks.PreToolUse of an unexpected shape; refusing to touch it",
+            out.sentence
+                .as_deref()
+                .unwrap_or("refusing to touch settings.json"),
         );
     }
-    if action == GuardAction::AlreadyCurrent {
+    if matches!(out.action, tp::TpAction::Unchanged) {
         return say(
             json,
             "already-installed",
             "the delegation gate is already installed",
         );
     }
-
-    backup_settings(&path).map_err(|e| format!("cannot back up {}: {e}", path.display()))?;
-    write_settings_atomic(&path, &settings)
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
 
     if !json {
         eprintln!(
@@ -532,6 +657,9 @@ pub fn cmd_install(json: bool) -> Result<(), String> {
         );
         eprintln!("    {} {}", "file:".dimmed(), path.display());
         eprintln!("    {} {}", "command:".dimmed(), hook_command());
+        if let Some(b) = &out.backup_path {
+            eprintln!("    {} {}", "backup:".dimmed(), b.display());
+        }
         eprintln!(
             "    {} it decides whether an agent may spawn a sub-agent. It does NOT restrict what an already-running sub-agent may call.",
             "note:".dimmed()
@@ -550,33 +678,50 @@ pub fn cmd_uninstall(json: bool) -> Result<(), String> {
             "no Claude Code config directory on this machine",
         );
     };
-    let mut settings = match read_settings(&path) {
-        Ok(v) => v,
-        Err(ReadError::NotFound) => return say(json, "not-installed", "there is no settings.json"),
-        Err(ReadError::Malformed(e)) => {
-            return say(
-                json,
-                "refused",
-                &format!("settings.json does not parse ({e}); refusing to touch it"),
-            )
-        }
-        Err(ReadError::Io(e)) => return Err(format!("cannot read {}: {e}", path.display())),
-    };
-    if !apply_uninstall(&mut settings) {
-        return say(
+
+    let out = tp::apply(&McpGuardSurface, tp::TpOp::Remove);
+
+    if matches!(out.action, tp::TpAction::Refused | tp::TpAction::Failed) {
+        return say_after_guard(
             json,
-            "not-installed",
-            "the delegation gate was not installed",
+            "refused",
+            out.sentence
+                .as_deref()
+                .unwrap_or("refusing to touch settings.json"),
         );
     }
-    write_settings_atomic(&path, &settings)
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    // 🔴 "Nothing happened" has two causes and the user needs to tell them
+    // apart: there is no file at all, versus a file that never had our hook.
+    if matches!(out.action, tp::TpAction::Unchanged) {
+        return if out.state_before == tp::TpConfigState::Missing {
+            say(json, "not-installed", "there is no settings.json")
+        } else {
+            say(
+                json,
+                "not-installed",
+                "the delegation gate was not installed",
+            )
+        };
+    }
+
     if !json {
         eprintln!(
             "  {} Delegation gate removed.",
             crate::symbols::CHECK.s().green()
         );
         eprintln!("    {} {}", "file:".dimmed(), path.display());
+        if let Some(b) = &out.backup_path {
+            eprintln!("    {} {}", "backup:".dimmed(), b.display());
+        }
+        // The guard deletes a settings.json that held nothing but our hook,
+        // rather than leaving an empty `{}` behind. Say so — a file quietly
+        // disappearing is worse than a file quietly emptied.
+        if matches!(out.action, tp::TpAction::Deleted) {
+            eprintln!(
+                "    {} the file held nothing else, so it was removed rather than left empty",
+                "note:".dimmed()
+            );
+        }
     }
     say(json, "uninstalled", "the delegation gate is removed")
 }
@@ -590,18 +735,11 @@ pub fn cmd_uninstall(json: bool) -> Result<(), String> {
 /// the only place a user can tell the difference.
 pub fn cmd_status(json: bool) -> Result<(), String> {
     use colored::Colorize;
-    let installed = match claude_settings_path() {
-        None => false,
-        Some(p) => match read_settings(&p) {
-            Ok(v) => v
-                .get("hooks")
-                .and_then(|h| h.get(harness().hook_event()))
-                .and_then(|l| l.as_array())
-                .map(|l| l.iter().any(is_ours))
-                .unwrap_or(false),
-            Err(_) => false,
-        },
-    };
+    // Read-only, through the same detector the install path verifies with, so
+    // "registered" here cannot drift from what install/uninstall believe.
+    // A stale command (OurResidue) still counts as registered: the gate really
+    // is wired, it just points at a binary that moved.
+    let installed = tp::inspect(&McpGuardSurface).detection.state.has_ours();
     let disabled = std::env::var_os(DISABLE_ENV).is_some_and(|v| !v.is_empty());
     let gateway = ask_gateway("Explore", 1);
 
@@ -768,6 +906,18 @@ pub fn cmd_preview(agent_type: &str, depth: i64, json: bool) -> Result<(), Strin
         "advisory".yellow()
     );
     println!("      enforce it. The decision printed above is the part that is enforced.");
+    Ok(())
+}
+
+/// Like `say`, for outcomes `third_party_config` has ALREADY reported.
+///
+/// 🔴 `tp::apply` prints its refusal sentence to stderr and emits the
+/// structured event itself. Routing those through `say` would print the same
+/// sentence twice in the human path, so this only owes the `--json` envelope.
+fn say_after_guard(json: bool, state: &str, message: &str) -> Result<(), String> {
+    if json {
+        return say(true, state, message);
+    }
     Ok(())
 }
 

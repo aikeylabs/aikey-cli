@@ -1868,6 +1868,31 @@ fn statusline_command_of(doc: &serde_json::Value) -> Option<&str> {
         .filter(|c| !c.is_empty())
 }
 
+/// Strict parse of Claude Code's `settings.json`.
+///
+/// 🔴 ONE definition, because TWO surfaces read this same file: `ClaudeSurface`
+/// (the statusLine slot) and `mcp_guard::McpGuardSurface` (the PreToolUse
+/// delegation hook). If they disagreed about what "parses" means, one of them
+/// would refuse a file the other had just written.
+///
+/// A whitespace-only file has always meant "no settings" here. Valid JSON that
+/// is not an object is an ERROR, not an empty document: the code before the
+/// guard silently replaced it with `{}`, which threw the user's content away.
+pub(crate) fn parse_claude_settings(text: &str) -> Result<serde_json::Value, tp::ParseFailure> {
+    if text.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    let v = tp::parse_json_strict(text)?;
+    if !v.is_object() {
+        return Err(tp::ParseFailure {
+            line: Some(1),
+            col: Some(1),
+            msg: "top level is not a JSON object".into(),
+        });
+    }
+    Ok(v)
+}
+
 impl tp::Surface for ClaudeSurface {
     type Doc = serde_json::Value;
     type Input = ClaudeInput;
@@ -1887,21 +1912,7 @@ impl tp::Surface for ClaudeSurface {
         claude_settings_path().unwrap_or_else(|| PathBuf::from("settings.json"))
     }
     fn load(&self, text: &str) -> Result<Self::Doc, tp::ParseFailure> {
-        // A whitespace-only file has always meant "no settings" here.
-        if text.trim().is_empty() {
-            return Ok(serde_json::json!({}));
-        }
-        let v = tp::parse_json_strict(text)?;
-        if !v.is_object() {
-            // Valid JSON but not a settings object: the old code silently
-            // replaced it with `{}` — which threw the user's content away.
-            return Err(tp::ParseFailure {
-                line: Some(1),
-                col: Some(1),
-                msg: "top level is not a JSON object".into(),
-            });
-        }
-        Ok(v)
+        parse_claude_settings(text)
     }
     fn empty_doc(&self) -> Self::Doc {
         serde_json::json!({})
@@ -2025,81 +2036,6 @@ fn format_number(n: i64) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// settings.json helpers — kept here for ONE remaining consumer: mcp_guard.rs.
-//
-// 🔴 WHY THIS BLOCK LOOKS ORPHANED. develop-v1.0.6 rewrote the statusline onto
-// the `tp::Surface` abstraction, which reads and writes settings.json itself,
-// so nothing in THIS file calls these any more. They are not dead:
-// src/mcp_guard.rs imports all five and uses them in 14 places. Deleting them
-// with the rest of the old statusline implementation is what a merge that took
-// develop's side wholesale would do, and it does not compile.
-//
-// ⚠️ PENDING DECISION, deliberately not taken here: develop-v1.0.6 also grew
-// `third_party_config::backup_versioned` ("the one door"), which supersedes the
-// single-shot backup below. Moving mcp_guard onto it changes backup semantics
-// from one canonical original to versioned copies — a behaviour change, not a
-// merge resolution, so it is left for its owner to decide. The other open
-// choice is placement: these belong in mcp_guard.rs now that it is the only
-// caller.
-// ---------------------------------------------------------------------------
-
-/// Where `backup_settings` parks the pre-aikey copy. One fixed name, not
-/// versioned: the first backup is the canonical "original state".
-fn statusline_backup_path(settings_path: &Path) -> PathBuf {
-    settings_path.with_file_name("settings.aikey_backup.json")
-}
-
-#[derive(Debug)]
-pub(crate) enum ReadError {
-    NotFound,
-    Malformed(serde_json::Error),
-    Io(io::Error),
-}
-
-pub(crate) fn read_settings(path: &Path) -> Result<serde_json::Value, ReadError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(ReadError::NotFound),
-        Err(e) => return Err(ReadError::Io(e)),
-    };
-    if bytes.iter().all(|b| b.is_ascii_whitespace()) {
-        return Ok(serde_json::json!({}));
-    }
-    serde_json::from_slice(&bytes).map_err(ReadError::Malformed)
-}
-
-/// Backup the current settings.json verbatim when it exists.  Skips silently
-/// if there's nothing to back up, or if a previous backup is already present
-/// (we never overwrite — the first backup is the canonical "original state").
-pub(crate) fn backup_settings(settings_path: &Path) -> io::Result<()> {
-    if !settings_path.exists() {
-        return Ok(());
-    }
-    let backup = statusline_backup_path(settings_path);
-    if backup.exists() {
-        return Ok(());
-    }
-    std::fs::copy(settings_path, &backup)?;
-    Ok(())
-}
-
-/// Atomic settings write: render the JSON into a sibling tmp file then
-/// rename it into place.  Matches the pattern the proxy uses for its own
-/// snapshot files — Claude Code may be reading settings.json at any moment
-/// as it renders the status line, so we can't tolerate a half-written file.
-pub(crate) fn write_settings_atomic(settings_path: &Path, value: &serde_json::Value) -> io::Result<()> {
-    let parent = settings_path.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "settings path has no parent")
-    })?;
-    std::fs::create_dir_all(parent)?;
-    let tmp = parent.join(".settings.aikey.tmp");
-    let pretty = serde_json::to_vec_pretty(value)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&tmp, &pretty)?;
-    std::fs::rename(&tmp, settings_path)?;
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {

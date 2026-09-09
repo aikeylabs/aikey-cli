@@ -7382,6 +7382,12 @@ pub fn handle_run_direct(
 }
 
 mod shell_integration;
+// 🔴 Test-only re-export: `mcp_guard::tests` reuses that module's `Sandbox`
+// (HOME / CLAUDE_CONFIG_DIR redirect + ENV_MUTATION_LOCK) rather than growing a
+// second copy. Only the test module is exposed, and only under `cfg(test)` —
+// `shell_integration` itself stays private.
+#[cfg(test)]
+pub(crate) use shell_integration::tp_invalid_file_suite;
 pub use shell_integration::*;
 
 // OpenClaw (龙虾 digital-employee) integration: `aikey hook {install,uninstall,
