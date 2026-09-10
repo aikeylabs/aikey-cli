@@ -4183,6 +4183,40 @@ mod status_candidates_tests {
         use crate::commands_account::third_party_config::{
             CodexLever, Detection, Inspection, SurfaceId, TpConfigState,
         };
+        // 🔴 HOME is an INPUT to this fence, so it is supplied instead of
+        // inherited (2026-09-10). `codex_desktop_row_state` started asking
+        // `client_route_is_bound("openai")` on 2026-09-09, and that reads
+        // `~/.aikey/active.env` out of the REAL home. This fence was never
+        // handed that input, so its verdict was decided by whichever unrelated
+        // test happened to own the process-global HOME at that moment: green in
+        // the full suite by luck, red in isolation on any machine with an
+        // OpenAI key bound, and - worst - permanently green on CI, where
+        // nothing is ever bound. That last property is why the operable branch
+        // below could not have been written before: on CI it was unreachable,
+        // so the fence could never fail for the defect it now covers.
+        //
+        // HomeVaultEnvGuard rather than a bare set_var pair: it pins the
+        // ENV_MUTATION_LOCK -> TEST_VAULT_LOCK order this crate settled on, and
+        // it restores HOME in Drop, so a failing assertion below cannot leave
+        // the rest of the suite pointed at a deleted temp dir.
+        // Bugfix: workflow/CI/bugfix/20260910-codex-row-fence-read-the-real-home.md
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join(".aikey")).unwrap();
+        let _guard = crate::test_env_lock::HomeVaultEnvGuard::new(home, &home.join("vault.db"));
+        let bind_openai = |bound: bool| {
+            let f = home.join(".aikey").join("active.env");
+            if bound {
+                std::fs::write(
+                    &f,
+                    "export OPENAI_API_KEY='aikey_active_openai'\n\
+                     export AIKEY_ACTIVE_KEYS='openai=work'\n",
+                )
+                .unwrap();
+            } else {
+                let _ = std::fs::remove_file(&f);
+            }
+        };
         let insp = |state: TpConfigState, lever: Option<CodexLever>| Inspection {
             surface: SurfaceId::Codex,
             path: std::path::PathBuf::from("/tmp/x/.codex/config.toml"),
@@ -4199,6 +4233,8 @@ mod status_candidates_tests {
             codex_desktop_row_state(&insp(TpConfigState::Missing, None)),
             ("not_installed", None)
         );
+        // Nothing bound: the sentence is TRUE here, so it must be on screen.
+        bind_openai(false);
         let (state, reason) =
             codex_desktop_row_state(&insp(TpConfigState::PresentNoAikey, Some(CodexLever::Off)));
         assert_eq!(state, "not_taken_over");
@@ -4206,6 +4242,20 @@ mod status_candidates_tests {
             reason.unwrap_or_default().contains("OpenAI key"),
             "the reason must tell the user the actionable next step"
         );
+        // 🔴 The SAME shape with openai actually bound (2026-09-09). A
+        // third party re-serialised ~/.codex/config.toml and dropped our block;
+        // the switch can rebuild it, so the row must be OPERABLE and carry NO
+        // reason. This is the user's 「codex 开不了」 report: the row said
+        // "activate an OpenAI key first" while the key was already active, and
+        // repeating the command returned the same sentence.
+        bind_openai(true);
+        assert_eq!(
+            codex_desktop_row_state(&insp(TpConfigState::PresentNoAikey, Some(CodexLever::Off))),
+            ("not_taken_over", None),
+            "a missing block under a LIVE openai binding must leave the switch operable"
+        );
+        // Back to unbound so every later row is judged on its own state.
+        bind_openai(false);
         assert_eq!(
             codex_desktop_row_state(&insp(TpConfigState::OursActive, Some(CodexLever::Off))),
             ("not_taken_over", None)
