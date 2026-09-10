@@ -1265,6 +1265,10 @@ pub enum PortReconcileOutcome {
     /// Drift detected and the full rewrite funnel ran (active.env + seq bump
     /// + codex/kimi/statusline/Desktop via the third-party funnel).
     Healed { from: u16, to: u16 },
+    /// A surface that a live binding REQUIRES had gone missing entirely (not
+    /// merely stale), and the same funnel rebuilt it. Distinct from `Healed`
+    /// because there is no "from" port — there was nothing there at all.
+    HealedMissing { surface: &'static str },
     /// Guard could not complete (vault DB unreadable, write failure, …).
     /// Callers must treat this as advisory — never block the main flow.
     Failed(String),
@@ -1305,7 +1309,58 @@ pub fn reconcile_baseurl_port() -> PortReconcileOutcome {
         ));
     };
 
-    // 2. Ports already written to downstream surfaces; any local mismatch
+    // 2. A surface that is MISSING, not merely stale.
+    //
+    // 🔴 Absence was invisible to this guard (2026-09-09). Step 3 compares
+    // PORTS, and `written_local_baseurl_ports` answers `None` both for "this
+    // surface is not ours" and for "our block is gone" — so a codex config a
+    // third party had re-serialised without our table read as InSync (active.env
+    // still carried the right port) and nothing was ever rebuilt.
+    //
+    // That is not cosmetic. hook.zsh's `codex` wrapper injects
+    // `-c model_provider=aikey` whenever the openai sentinel is set, and the
+    // sentinel lives in active.env, which the third party did not touch. So the
+    // wrapper kept pointing Codex at a provider block that no longer existed and
+    // `codex` failed outright with "Model provider `aikey` not found" — a broken
+    // main path, with the tray switch greyed out and telling the user to
+    // "activate an OpenAI key first" while their openai key was active.
+    //
+    // The invariant is "openai bound ⇒ our block is in ~/.codex/config.toml",
+    // it was maintained by WRITE EVENTS only, and this is its idempotent
+    // reconcile read — mounted on the path every `codex` launch already takes
+    // (`aikey proxy ensure-running`, via aikey_preflight). Per
+    // principles/event-write-reconcile-read.md.
+    //
+    // Rebuilding is safe to do without asking: a standing "never" refusal is
+    // still honoured inside configure_codex_cli, and the block is a projection
+    // of the binding exactly as active.env is. The takeover LEVER is not
+    // restored by re-applying an existing block — see codex_merge_doc — so a
+    // switch the user turned off stays off.
+    // Bugfix: workflow/CI/bugfix/20260909-tray-three-desktop-defects.md
+    // 🔴 Rebuild ONLY the missing surface, and WITHOUT the vault (2026-09-09).
+    //
+    // The port-drift path below re-runs the whole funnel through
+    // `refresh_implicit_profile_activation`, which reads bindings out of the
+    // vault DB. This one deliberately does not, on two counts:
+    //
+    //   • It does not need to. Both inputs are already in hand — that openai is
+    //     bound came from active.env, and the port came from runtime.json. A
+    //     vault read here would make the repair fail exactly when the vault is
+    //     locked, which is a state a user hits often and cannot see the
+    //     connection to.
+    //   • It should not. Drift means every surface is stale together, so they
+    //     re-anchor together. This is one file that a third party emptied; kimi,
+    //     the statusline and the Desktop profile are fine and must not be
+    //     rewritten as collateral.
+    //
+    // Non-interactive: this runs mid-`codex`-launch, where stderr is a terminal
+    // and a consent prompt would ambush the user (see configure_codex_cli_with).
+    if let Some(surface) = missing_bound_surface() {
+        crate::commands_account::configure_codex_cli_with(actual_port, false);
+        return PortReconcileOutcome::HealedMissing { surface };
+    }
+
+    // 3. Ports already written to downstream surfaces; any local mismatch
     // triggers the full funnel rewrite (all surfaces re-anchor together).
     let surfaces = written_local_baseurl_ports();
     let Some(written_port) = surfaces
@@ -1319,7 +1374,7 @@ pub fn reconcile_baseurl_port() -> PortReconcileOutcome {
         };
     };
 
-    // 3. Drift → rewrite through the single existing funnel (never a
+    // 4. Drift → rewrite through the single existing funnel (never a
     // parallel write path). refresh bumps AIKEY_ACTIVE_SEQ, so already-open
     // terminals re-source active.env at their next prompt via the hook.
     eprintln!(
@@ -1354,6 +1409,63 @@ pub fn reconcile_baseurl_port() -> PortReconcileOutcome {
             PortReconcileOutcome::Failed(e)
         }
     }
+}
+
+/// The one surface whose ABSENCE is a defect rather than a state: codex.
+///
+/// Returns `Some("codex")` when openai is bound (so the `codex` wrapper is
+/// already injecting `-c model_provider=aikey`) and `~/.codex/config.toml`
+/// parses but no longer carries our provider block. Every other combination is
+/// a legitimate state and must not trigger a write:
+///
+///   - file missing entirely → Codex has never run here; creating a config for
+///     an app the user does not have is not a repair.
+///   - file unparseable → the third-party-config guard owns it; automatic
+///     paths refuse and `aikey hook repair codex` is the door (2026-09-05).
+///   - openai not bound → there is nothing to point the block at, and
+///     `aikey unuse openai` removing the block is the DESIGNED outcome.
+pub(crate) fn missing_bound_surface() -> Option<&'static str> {
+    use crate::commands_account::third_party_config::TpConfigState;
+    if !client_route_is_bound("openai") {
+        return None;
+    }
+    let state = crate::commands_account::codex_inspection().detection.state;
+    (state == TpConfigState::PresentNoAikey).then_some("codex")
+}
+
+/// True when `client_route` currently has an active binding on this machine,
+/// read from the SAME place the shell wrappers read it: the `AIKEY_ACTIVE_KEYS`
+/// line of `active.env` (`route=alias,route=alias`).
+///
+/// 🔴 Deliberately not a DB query (2026-09-09). The invariant this exists to
+/// serve is "the `codex` wrapper injects `-c model_provider=aikey` **because**
+/// this sentinel is set" — hook.zsh gates on `$OPENAI_API_KEY == aikey_active_*`,
+/// which is rendered from this same line. Asking the database instead would let
+/// the status row and the wrapper disagree about whether openai is bound, which
+/// is the whole class of bug being fixed. Same string, same answer.
+/// Bugfix: workflow/CI/bugfix/20260909-tray-three-desktop-defects.md
+pub fn client_route_is_bound(client_route: &str) -> bool {
+    let path = crate::commands_account::resolve_aikey_dir().join("active.env");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    active_keys_contain_route(&text, client_route)
+}
+
+/// Pure core of `client_route_is_bound`, split out so the parse is testable
+/// without a filesystem.
+pub(crate) fn active_keys_contain_route(active_env: &str, client_route: &str) -> bool {
+    for line in active_env.lines() {
+        let Some(rest) = line.trim().strip_prefix("export AIKEY_ACTIVE_KEYS=") else {
+            continue;
+        };
+        let rest = rest.trim().trim_matches('\'').trim_matches('"');
+        return rest
+            .split(',')
+            .filter_map(|pair| pair.split_once('='))
+            .any(|(route, alias)| route == client_route && !alias.is_empty());
+    }
+    false
 }
 
 /// `(surface label, locally-written port)` for every downstream config that
@@ -2263,5 +2375,171 @@ mod active_key_axis_tests {
             !line.contains(wrong.as_str()),
             "the client_route axis is being written into active_key_providers again"
         );
+    }
+}
+
+#[cfg(test)]
+mod bound_route_sentinel_tests {
+    use super::*;
+
+    /// 🔴 The status row, the reconcile guard and hook.zsh's `codex` wrapper
+    /// must all answer "is openai bound?" from the SAME string (2026-09-09).
+    ///
+    /// The wrapper gates its `-c model_provider=aikey` injection on the openai
+    /// sentinel, which is rendered from this line. When the row asked a
+    /// different source it could report "activate an OpenAI key first" on a
+    /// machine whose wrapper was, at that same moment, injecting the flag —
+    /// which is exactly the contradiction the user hit.
+    /// Bugfix: workflow/CI/bugfix/20260909-tray-three-desktop-defects.md
+    #[test]
+    fn active_keys_line_is_parsed_the_way_the_shell_hook_parses_it() {
+        let env = "export OPENAI_API_KEY='aikey_active_openai'\n\
+                   export AIKEY_ACTIVE_KEYS='anthropic=work,openai=sbopenai'\n";
+        assert!(active_keys_contain_route(env, "openai"));
+        assert!(active_keys_contain_route(env, "anthropic"));
+        assert!(!active_keys_contain_route(env, "moonshot"));
+    }
+
+    /// A prefix must not count as a route: `openai_compatible=x` is a different
+    /// bucket, and matching it would make the guard rebuild a codex block for a
+    /// binding that does not serve codex.
+    #[test]
+    fn a_route_is_matched_whole_not_by_prefix() {
+        let env = "export AIKEY_ACTIVE_KEYS='openai_compat=x'\n";
+        assert!(!active_keys_contain_route(env, "openai"));
+    }
+
+    /// No bindings at all (or no file) is "not bound" — never a rebuild.
+    #[test]
+    fn an_empty_or_absent_line_is_not_a_binding() {
+        assert!(!active_keys_contain_route("", "openai"));
+        assert!(!active_keys_contain_route(
+            "export AIKEY_ACTIVE_KEYS=''\n",
+            "openai"
+        ));
+        assert!(!active_keys_contain_route(
+            "export AIKEY_ACTIVE_KEYS='openai='\n",
+            "openai"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod missing_surface_reconcile_tests {
+    use super::*;
+
+    /// The repair above is only worth anything if this guard is still MOUNTED on
+    /// the path a `codex` launch takes: hook.zsh's `aikey_preflight` runs
+    /// `aikey proxy ensure-running`, whose already-running fast path is the
+    /// consumption-side reconcile point (added 20260728 for port drift, reused
+    /// here for a missing surface).
+    ///
+    /// Fenced at the source because the alternative is a full installed proxy —
+    /// the behaviour needs a rendered `aikey-proxy.yaml` and a vault, which a
+    /// unit test has neither of. Stated plainly so nobody reads this as a live
+    /// proof: it pins the WIRING, and the repair itself is proven live by the
+    /// test below.
+    /// Bugfix: workflow/CI/bugfix/20260909-tray-three-desktop-defects.md
+    #[test]
+    fn the_guard_is_still_mounted_on_the_launch_path() {
+        let src = include_str!("commands_proxy.rs");
+        let mount = src
+            .find("if matches!(entry_state, crate::proxy_state::ProxyState::Running { .. }) {")
+            .expect(
+                "ensure_proxy_for_use no longer has an already-running fast path — the reconcile \
+                 point every claude/codex launch passes through has moved",
+            );
+        let branch = &src[mount..(mount + 900).min(src.len())];
+        assert!(
+            branch.contains("reconcile_baseurl_port()"),
+            "the already-running fast path no longer reconciles. A drifted or \
+             third-party-emptied surface is then never repaired, and `codex` fails \
+             with \"Model provider `aikey` not found\" on every launch with nothing \
+             explaining why."
+        );
+    }
+
+    /// End-to-end shape of the repair, on the real function, with a real
+    /// (pid-verified) runtime snapshot — no vault, because the repair must not
+    /// need one.
+    ///
+    /// 🔴 The defect this proves gone (2026-09-09): the Codex/ChatGPT desktop
+    /// app re-serialises `~/.codex/config.toml` with only its own keys, our
+    /// `[model_providers.aikey]` table disappears, and NOTHING put it back —
+    /// this guard compared PORTS, and a surface that is absent has no port to
+    /// disagree about, so it read as InSync. Meanwhile hook.zsh's `codex`
+    /// wrapper kept injecting `-c model_provider=aikey` (its gate is the openai
+    /// sentinel in active.env, which the third party never touched), so `codex`
+    /// failed with "Model provider `aikey` not found" on every launch.
+    /// Bugfix: workflow/CI/bugfix/20260909-tray-three-desktop-defects.md
+    #[test]
+    fn a_third_party_that_drops_our_codex_block_is_healed_on_the_next_launch() {
+        // 🔴 BOTH locks, through the shared helper (2026-09-09). The first cut
+        // of this test took only ENV_MUTATION_LOCK — but the repair reaches
+        // `codex_base_url`, which asks storage whether the openai binding is a
+        // cluster direct-bind, so it OPENS THE VAULT. Racing the vault tests
+        // that way made `executor::pre_init_vault_with_no_salt_still_allowed_
+        // through_fallback` fail once and pass in isolation: a flake I created
+        // and would have shipped as "someone else's".
+        // HomeVaultEnvGuard exists for exactly this pair and pins the lock
+        // order (env then vault).
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let home = dir.path();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::create_dir_all(home.join(".aikey/run")).unwrap();
+        let _guard = crate::test_env_lock::HomeVaultEnvGuard::new(home, &home.join("vault.db"));
+        let prev_run = std::env::var_os("AIKEY_RUN_DIR");
+        std::env::remove_var("AIKEY_RUN_DIR");
+
+        // openai bound — the sentinel the codex wrapper gates its injection on.
+        std::fs::write(
+            home.join(".aikey/active.env"),
+            "export OPENAI_API_KEY='aikey_active_openai'\n\
+             export AIKEY_ACTIVE_KEYS='openai=work'\n",
+        )
+        .unwrap();
+        // A live proxy: this process is the pid, so the liveness probe passes.
+        std::fs::write(
+            home.join(".aikey/run/proxy-runtime.json"),
+            format!(
+                "{{\"pid\":{},\"listen\":{{\"actual_addr\":\"127.0.0.1:27219\"}}}}",
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        // What the third party left: parses fine, none of our keys.
+        let user_content = "model = \"gpt-6-astra\"\n\n[features]\njs_repl = false\n";
+        std::fs::write(home.join(".codex/config.toml"), user_content).unwrap();
+
+        let outcome = reconcile_baseurl_port();
+        assert_eq!(
+            outcome,
+            PortReconcileOutcome::HealedMissing { surface: "codex" },
+            "a codex block missing under a live openai binding must be rebuilt"
+        );
+
+        let healed = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+        assert!(
+            healed.contains("[model_providers.aikey]"),
+            "the provider block was not restored:\n{healed}"
+        );
+        assert!(
+            healed.contains("127.0.0.1:27219"),
+            "the restored block must carry the LIVE port, not a remembered one:\n{healed}"
+        );
+        // The user's own keys survive — this is a repair, not a replacement.
+        assert!(healed.contains("model = \"gpt-6-astra\""), "{healed}");
+        assert!(healed.contains("js_repl = false"), "{healed}");
+
+        // Idempotent: running it again finds nothing to do.
+        assert_eq!(
+            reconcile_baseurl_port(),
+            PortReconcileOutcome::InSync { port: 27219 },
+            "the repair must not re-fire once the block is back"
+        );
+
+        if let Some(v) = prev_run {
+            std::env::set_var("AIKEY_RUN_DIR", v);
+        }
     }
 }
