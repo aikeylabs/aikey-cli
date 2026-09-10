@@ -3087,6 +3087,16 @@ pub const INTEGRATION_STATES: &[&str] = &[
     "config_invalid",
 ];
 
+/// Test seam for `codex_desktop_row_state`, which is private to this module but
+/// is the projection the tray's switch reads. Exposed rather than duplicated so
+/// the fence exercises the production function.
+#[cfg(test)]
+pub(crate) fn codex_desktop_row_state_for_test(
+    inspection: &crate::commands_account::third_party_config::Inspection,
+) -> (&'static str, Option<String>) {
+    codex_desktop_row_state(inspection)
+}
+
 fn codex_desktop_row_state(
     inspection: &crate::commands_account::third_party_config::Inspection,
 ) -> (&'static str, Option<String>) {
@@ -3120,11 +3130,29 @@ fn codex_desktop_row_state(
                 _ => {
                     if det.state == TpConfigState::OursActive {
                         ("not_taken_over", None)
+                    } else if crate::profile_activation::client_route_is_bound("openai") {
+                        // 🔴 Parses, no aikey provider block, but openai IS
+                        // bound (2026-09-09). The block is derived state that
+                        // went missing — a third party re-serialised
+                        // `~/.codex/config.toml` and dropped our table — so the
+                        // switch can rebuild it (see
+                        // set_codex_top_level_provider) and must be OPERABLE.
+                        //
+                        // It used to carry "activate an OpenAI key first" here,
+                        // which is false whenever this branch is reached: the
+                        // key IS active. That greyed the switch out with an
+                        // instruction the user had already followed, and the
+                        // same sentence came back if they ran the command
+                        // anyway — five times, in the report this was found in.
+                        // Bugfix: workflow/CI/bugfix/20260909-tray-three-desktop-defects.md
+                        ("not_taken_over", None)
                     } else {
-                        // Parses, but no aikey provider block: turning this on
-                        // would write `model_provider = "aikey"` pointing at
-                        // nothing ("Model provider aikey not found"). Same
-                        // precondition the write guard enforces, same words.
+                        // Parses, no aikey provider block, and nothing bound to
+                        // build one from: turning this on would write
+                        // `model_provider = "aikey"` pointing at nothing
+                        // ("Model provider aikey not found"). Same precondition
+                        // the write guard enforces, same words — and here the
+                        // words are true.
                         (
                             "not_taken_over",
                             Some(

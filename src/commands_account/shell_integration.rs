@@ -907,13 +907,40 @@ pub(super) fn codex_merge_doc(
     // original that also honoured a `# managed by aikey` line marker).
     let model_provider_written = !matches!(codex_lever_of(&doc), tp::CodexLever::Foreign { .. });
 
+    // 🔴 The lever is written ONLY while we are CREATING the block (2026-09-09).
+    //
+    // The lever (`model_provider = "aikey"`) is the desktop/IDE takeover switch,
+    // and turning that switch OFF removes exactly this line while leaving the
+    // provider block in place (`hook uninstall codex-desktop`). So on a re-apply
+    // the absence of the line is the USER'S ANSWER, not a gap to fill — and
+    // unconditionally writing it silently reversed them: measured 2026-09-09,
+    // `hook uninstall codex-desktop` followed by any `aikey use` put the line
+    // back and flipped the row from not_taken_over to taken_over, with nothing
+    // said. Every binding change re-enabled a switch the user had turned off.
+    //
+    // "Creating the block" is the one moment there is no answer to respect, and
+    // it is also the moment the consent prompt above ran — so the first scaffold
+    // takes over (unchanged default) and nothing after it does.
+    //
+    // The one case this cannot honour: a third party deletes the whole block. We
+    // then have no record that the switch was off — that record lived only in
+    // the file they rewrote — and the machine falls back to the default. Said
+    // out loud here because the alternative (a second copy of the switch state
+    // in aikey's own dir) is state we would then have to keep true forever.
+    // Bugfix: workflow/CI/bugfix/20260909-tray-three-desktop-defects.md
+    let creating_block = doc
+        .get("model_providers")
+        .and_then(|i| i.as_table_like())
+        .and_then(|t| t.get("aikey"))
+        .is_none();
+
     // Top-level scalars. No positioning needed: toml_edit's Document renderer
     // structurally emits ALL root-level values before ANY `[table]` section
     // (encode.rs Display for Document — root node's get_values() render first,
     // then tables sorted by position), so a scalar can never land after a table
     // header regardless of insertion order.
     doc["openai_base_url"] = value(base_url);
-    if model_provider_written {
+    if model_provider_written && creating_block {
         doc["model_provider"] = value("aikey");
     }
 
@@ -1012,6 +1039,22 @@ fn codex_consent_blocks(first_time: bool, stored: Option<&str>) -> bool {
 }
 
 pub fn configure_codex_cli(proxy_port: u16) -> Option<tp::SurfaceOutcome> {
+    configure_codex_cli_with(proxy_port, true)
+}
+
+/// `configure_codex_cli` with the first-run consent PROMPT under caller control.
+///
+/// 🔴 `interactive = false` exists for the reconcile guard (2026-09-09), which
+/// runs inside `aikey proxy ensure-running` — i.e. in the middle of a `codex`
+/// launch, where stderr IS a terminal. Asking "Configure Codex? [Y/n/never]"
+/// there would put a question in front of a user who typed `codex`, about a
+/// file that already had our block until something else rewrote it. Same
+/// argument, same flag name, as `apply_third_party_cli_configs_with`.
+///
+/// A standing `never` refusal is still honoured — that check is below and is
+/// not gated on the prompt.
+/// Bugfix: workflow/CI/bugfix/20260909-tray-three-desktop-defects.md
+pub fn configure_codex_cli_with(proxy_port: u16, interactive: bool) -> Option<tp::SurfaceOutcome> {
     use colored::Colorize;
     use std::io::{IsTerminal, Write};
 
@@ -1039,7 +1082,7 @@ pub fn configure_codex_cli(proxy_port: u16) -> Option<tp::SurfaceOutcome> {
     if codex_consent_blocks(first_time, stored_consent.as_deref()) {
         return None;
     }
-    if first_time && io::stderr().is_terminal() {
+    if interactive && first_time && io::stderr().is_terminal() {
         let mut rows: Vec<String> = vec![
             format!("File:    {}", display_path(".codex/config.toml")),
             "Add:     openai_base_url + [model_providers.aikey]".to_string(),
@@ -1540,13 +1583,42 @@ impl tp::Surface for CodexSurface {
 /// both file-only clients, so they ride this line together and cannot be split
 /// from each other.
 ///
-/// 🚫 It deliberately does NOT create the config or the provider block. Turning
-/// this on without a block would leave `model_provider = "aikey"` pointing at a
-/// provider that does not exist, and Codex fails with "Model provider `aikey`
-/// not found" — the same shape as bugfix 2026-05-18. Absent block ⇒ no-op, and
-/// the caller's state projection keeps reporting "not taken over", which is the
-/// truth.
+/// 🚫 It never points the lever at a block that does not exist — that is the
+/// 2026-05-18 shape, "Model provider `aikey` not found". What it does when the
+/// block is missing depends on whether the block is missing FOR A REASON:
+///
+///   - openai is not bound on this machine ⇒ genuine precondition, refused with
+///     "activate an OpenAI key first". That sentence is then true and leads
+///     somewhere.
+///   - openai IS bound ⇒ the block is derived state that has gone missing
+///     (a third party re-serialised `~/.codex/config.toml` and dropped our
+///     table), and it is rebuilt here before the lever is set. See the scaffold
+///     call below for why refusing was wrong.
 pub fn set_codex_top_level_provider(on: bool) -> Result<(), String> {
+    // 🔴 Rebuild a block that went missing under an ACTIVE openai binding
+    // (2026-09-09).
+    //
+    // Measured: bind an openai key (block written, row `taken_over`), let the
+    // Codex/ChatGPT desktop app rewrite config.toml with only its own keys, and
+    // the row becomes `not_taken_over` with "activate an OpenAI key first" —
+    // told to activate a key that is already active, on a switch that refuses
+    // with the same sentence when clicked. The 2026-09-05 guard fixed exactly
+    // this class of "instruction that could not work" for unparseable files;
+    // this is its sibling for parseable ones.
+    //
+    // Refusing was wrong because everything needed to succeed is already known:
+    // there is an openai binding and a proxy port. The block is not a decision,
+    // it is a projection of the binding — the same status as active.env, which
+    // we rewrite without asking anyone.
+    // Bugfix: workflow/CI/bugfix/20260909-tray-three-desktop-defects.md
+    if on {
+        let det = codex_inspection().detection;
+        if det.state == tp::TpConfigState::PresentNoAikey
+            && crate::profile_activation::client_route_is_bound("openai")
+        {
+            configure_codex_cli(crate::commands_proxy::proxy_port());
+        }
+    }
     // Through the guard: strict parse, refusals with the shared sentences
     // (TP_BLOCK_MISSING / TP_LEVER_FOREIGN — the same words status --json
     // shows), versioned backup, verify, one atomic write.
@@ -3578,6 +3650,82 @@ mod hook_tests {
         } else {
             TomlMergeOutcome::Changed(out)
         }
+    }
+
+    // ── the desktop/IDE lever is the USER'S answer, not a gap to fill ───────
+
+    /// 🔴 `hook uninstall codex-desktop` removes the top-level
+    /// `model_provider = "aikey"` line and leaves the provider block. So on a
+    /// RE-apply, an absent lever means "the user turned this off", and writing
+    /// it back reverses them silently.
+    ///
+    /// Measured before the fix (2026-09-09, sandbox HOME): `hook uninstall
+    /// codex-desktop` → row `not_taken_over`; one `aikey use <openai key>` →
+    /// the line is back and the row reads `taken_over`, with nothing printed.
+    /// Every binding change re-enabled a switch the user had switched off.
+    /// Bugfix: workflow/CI/bugfix/20260909-tray-three-desktop-defects.md
+    #[test]
+    fn reapplying_the_scaffold_leaves_a_switched_off_lever_off() {
+        // Exactly what `hook uninstall codex-desktop` leaves behind: our block,
+        // our base_url, no lever.
+        let switched_off = "openai_base_url = \"http://127.0.0.1:27200/openai\"\n\
+                            \n[model_providers.aikey]\n\
+                            name = \"aikey\"\n\
+                            base_url = \"http://127.0.0.1:27200/openai\"\n\
+                            experimental_bearer_token = \"aikey_active_openai\"\n\
+                            wire_api = \"responses\"\n\
+                            requires_openai_auth = false\n";
+        let (outcome, written) = codex_merge(switched_off, "http://127.0.0.1:27200/openai");
+        assert!(
+            written,
+            "no foreign value is present, so the conflict flag must stay true"
+        );
+        let rendered = match outcome {
+            TomlMergeOutcome::Unchanged => switched_off.to_string(),
+            TomlMergeOutcome::Changed(t) => t,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert!(
+            !rendered.contains("\nmodel_provider = \"aikey\"")
+                && !rendered.starts_with("model_provider = \"aikey\""),
+            "re-applying the scaffold put the desktop/IDE lever back on a switch \
+             the user had turned off:\n{rendered}"
+        );
+    }
+
+    /// The other half of the same rule: the FIRST scaffold still takes over, so
+    /// the onboarding default is unchanged. Without this the fix above would
+    /// silently mean "codex desktop is never taken over automatically".
+    #[test]
+    fn the_first_scaffold_still_sets_the_lever() {
+        let (outcome, _) = codex_merge("model = \"gpt-5\"\n", "http://127.0.0.1:27200/openai");
+        let TomlMergeOutcome::Changed(rendered) = outcome else {
+            panic!("creating the block must change the file");
+        };
+        assert!(
+            rendered.contains("model_provider = \"aikey\""),
+            "a first scaffold must still take over codex desktop:\n{rendered}"
+        );
+        assert!(rendered.contains("[model_providers.aikey]"));
+    }
+
+    /// And a foreign value still wins over both rules — restore-fidelity
+    /// (2026-08-18) is not weakened by the first-scaffold carve-out.
+    #[test]
+    fn a_foreign_lever_is_never_overwritten_even_on_a_first_scaffold() {
+        let (outcome, written) = codex_merge(
+            "model_provider = \"ollama\"\n",
+            "http://127.0.0.1:27200/openai",
+        );
+        assert!(!written, "a foreign value must report the conflict");
+        let TomlMergeOutcome::Changed(rendered) = outcome else {
+            panic!("the block still has to be created");
+        };
+        assert!(
+            rendered.contains("model_provider = \"ollama\""),
+            "the user's provider was overwritten:\n{rendered}"
+        );
+        assert!(rendered.contains("[model_providers.aikey]"));
     }
 
     // ── v3 hook content sanity ──────────────────────────────────────────────
@@ -6090,6 +6238,141 @@ mod path_helper_tests {
                 None => std::env::remove_var("USERPROFILE"),
             }
         }
+    }
+
+    // ── a block that went missing under a live binding ──────────────────────
+
+    /// Lay out a HOME where openai IS bound and `~/.codex/config.toml` parses
+    /// but no longer carries our provider block — i.e. what the Codex/ChatGPT
+    /// desktop app leaves behind when it re-serialises the file with only its
+    /// own keys.
+    fn home_with_openai_bound_and_no_codex_block(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join(".codex")).unwrap();
+        std::fs::create_dir_all(dir.join(".aikey")).unwrap();
+        std::fs::write(
+            dir.join(".codex/config.toml"),
+            "model = \"gpt-6-astra\"\n\n[features]\njs_repl = false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".aikey/active.env"),
+            "export OPENAI_API_KEY='aikey_active_openai'\n\
+             export AIKEY_ACTIVE_KEYS='openai=sbopenai'\n",
+        )
+        .unwrap();
+    }
+
+    /// 🔴 The reconcile fires for exactly ONE combination (2026-09-09).
+    ///
+    /// The guard rebuilds a third-party file, so every other state has to stay
+    /// untouched: an absent file means Codex was never installed here, an
+    /// unparseable one belongs to `aikey hook repair` (2026-09-05), and an
+    /// unbound openai means `aikey unuse openai` removing the block did exactly
+    /// what it was asked to.
+    /// Bugfix: workflow/CI/bugfix/20260909-tray-three-desktop-defects.md
+    #[test]
+    fn only_a_missing_block_under_a_live_binding_is_reconciled() {
+        let _snap = EnvSnapshot::take();
+        let dir = std::env::temp_dir().join(format!("aikey-codex-recon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        home_with_openai_bound_and_no_codex_block(&dir);
+        std::env::set_var("HOME", &dir);
+        std::env::set_var("USERPROFILE", &dir);
+
+        assert_eq!(
+            crate::profile_activation::missing_bound_surface(),
+            Some("codex"),
+            "openai bound + parseable config without our block is the defect state"
+        );
+
+        // Our block present again → nothing to do.
+        std::fs::write(
+            dir.join(".codex/config.toml"),
+            "[model_providers.aikey]\nname = \"aikey\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            crate::profile_activation::missing_bound_surface(),
+            None,
+            "a present block must never trigger a rewrite"
+        );
+
+        // Unparseable → the repair guard owns it, not this.
+        std::fs::write(
+            dir.join(".codex/config.toml"),
+            "model_provider = \"a\"\nmodel_provider = \"b\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            crate::profile_activation::missing_bound_surface(),
+            None,
+            "an unparseable file belongs to `aikey hook repair codex`"
+        );
+
+        // No file → Codex has never run here.
+        std::fs::remove_file(dir.join(".codex/config.toml")).unwrap();
+        assert_eq!(
+            crate::profile_activation::missing_bound_surface(),
+            None,
+            "creating a config for an app the user does not have is not a repair"
+        );
+
+        // Block missing again, but openai NOT bound → `unuse` did its job.
+        home_with_openai_bound_and_no_codex_block(&dir);
+        std::fs::write(
+            dir.join(".aikey/active.env"),
+            "export AIKEY_ACTIVE_KEYS=''\n",
+        )
+        .unwrap();
+        assert_eq!(
+            crate::profile_activation::missing_bound_surface(),
+            None,
+            "with nothing bound there is nothing to point a block at"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 The row must not carry an instruction the user has already followed
+    /// (2026-09-09). With openai bound and our block gone, the switch can
+    /// rebuild it — so the row is OPERABLE, not greyed out with
+    /// "activate an OpenAI key first".
+    #[test]
+    fn a_missing_block_under_a_live_binding_leaves_the_switch_operable() {
+        let _snap = EnvSnapshot::take();
+        let dir = std::env::temp_dir().join(format!("aikey-codex-row-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        home_with_openai_bound_and_no_codex_block(&dir);
+        std::env::set_var("HOME", &dir);
+        std::env::set_var("USERPROFILE", &dir);
+
+        let inspection = crate::commands_account::codex_inspection();
+        let (state, reason) =
+            crate::commands_account::codex_desktop_row_state_for_test(&inspection);
+        assert_eq!(state, "not_taken_over");
+        assert_eq!(
+            reason, None,
+            "the switch was greyed out with a reason the user cannot act on — \
+             their OpenAI key is active, which is what the sentence asks for"
+        );
+
+        // …and with nothing bound the sentence comes back, because there it is true.
+        std::fs::write(
+            dir.join(".aikey/active.env"),
+            "export AIKEY_ACTIVE_KEYS=''\n",
+        )
+        .unwrap();
+        let inspection = crate::commands_account::codex_inspection();
+        let (state, reason) =
+            crate::commands_account::codex_desktop_row_state_for_test(&inspection);
+        assert_eq!(state, "not_taken_over");
+        assert_eq!(
+            reason.as_deref(),
+            Some("activate an OpenAI key first"),
+            "with no openai binding this really is the next step"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── display_path ────────────────────────────────────────────────────────
