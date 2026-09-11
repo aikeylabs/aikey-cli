@@ -1709,7 +1709,13 @@ mod tests {
         // ── 复现证据输出 ──
         let material_after = route_material_for_anthropic(27200);
         let state_after = detect_state(&paths);
-        eprintln!("── 复现现场 ──");
+        // Box-drawing goes through the Fancy/Safe table even in a test's repro
+        // output: tests/glyph_fence.rs scans every non-comment line under src/,
+        // test modules included, and this inline U+2500 kept that fence (and so
+        // every CI run on develop-v1.0.6) red. BOX_H renders the identical rule
+        // under the Fancy tier - same idiom as commands_app/handlers.rs.
+        let rule = crate::symbols::BOX_H.s().repeat(2);
+        eprintln!("{rule} 复现现场 {rule}");
         eprintln!("  VK local_state      : disabled_by_account_scope（login 打标）");
         eprintln!("  binding 行           : 仍存在（无人清理）");
         eprintln!(
