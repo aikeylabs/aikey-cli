@@ -9467,6 +9467,73 @@ mod core_tests {
         );
     }
 
+    /// Fence: `*_API_KEY` and `*_BASE_URL` are exported as a PAIR, for every
+    /// client route — the openai family included.
+    ///
+    /// Why this fence exists: until 2026-09-11 the openai/gpt/chatgpt routes
+    /// were deliberately skipped out of the base-url export ("Codex reads
+    /// config.toml instead"), so active.env carried the `aikey_active_openai`
+    /// sentinel key with NO base url. Every OpenAI-SDK consumer in the shell
+    /// (Codex's image tool, python scripts) then fell back to
+    /// https://api.openai.com/v1 and sent the sentinel as a real key — a 401
+    /// that reads as "your key is invalid", plus a silent bypass of aikey's
+    /// accounting, quota and DLP.
+    ///
+    /// How to make this go red: put any route back into a skip list in
+    /// `profile_activation.rs`, or emit an `unset` for a var that was exported.
+    ///
+    /// bugfix: workflow/CI/bugfix/20260911-openai-base-url-not-exported-breaks-image-generation.md
+    #[test]
+    fn active_env_exports_base_url_for_every_route() {
+        let (dir, _guard) = setup_vault();
+        let mut entry = vk_entry("vk-openai-pair", None, None, None);
+        entry.alias = "openai-pair".into();
+        entry.provider_code = "openai".into();
+        entry.protocol_type = "openai_compatible".into();
+        entry.supported_providers = vec!["openai".into()];
+        storage::upsert_virtual_key_cache(&entry).unwrap();
+        storage::set_client_route_binding(
+            crate::profile_activation::DEFAULT_PROFILE,
+            "openai",
+            "openai",
+            "openai_compatible",
+            "personal",
+            &entry.virtual_key_id,
+        )
+        .unwrap();
+        crate::profile_activation::refresh_implicit_profile_activation().unwrap();
+
+        let env = std::fs::read_to_string(dir.path().join(".aikey/active.env")).unwrap();
+
+        // 1. The regression itself: the openai route must carry both halves.
+        assert!(
+            env.contains("OPENAI_API_KEY='aikey_active_openai'"),
+            "openai route must export the sentinel key: {env}"
+        );
+        assert!(
+            env.contains("export OPENAI_BASE_URL='http://127.0.0.1:"),
+            "openai route must ALSO export OPENAI_BASE_URL — a key without a \
+             base url sends the sentinel to api.openai.com as a real key: {env}"
+        );
+
+        // 2. Generic: nothing may be exported and unset in the same file.
+        //    A trailing `unset` silently wins over an earlier `export` under
+        //    `source`, which is exactly how half a pair gets shipped.
+        let exported: Vec<String> = env
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("export "))
+            .filter_map(|l| l.split('=').next())
+            .map(|v| v.to_string())
+            .collect();
+        for var in &exported {
+            assert!(
+                !env.contains(&format!("unset {} 2>/dev/null", var)),
+                "{var} is both exported and unset in active.env — under `source` \
+                 the later line wins, so one of the two is a lie: {env}"
+            );
+        }
+    }
+
     #[test]
     fn unreadable_managed_projection_refreshes_defensively() {
         let (_dir, _guard) = setup_vault();
