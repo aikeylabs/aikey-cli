@@ -277,15 +277,37 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
                     &token,
                 );
             }
-            // Why: Codex v0.118+ warns when OPENAI_BASE_URL env var is set,
-            // because it now reads openai_base_url from ~/.codex/config.toml.
-            // We inject that config via configure_codex_cli(), so skip the
-            // env var to avoid the deprecation warning.
-            let skip_base_url = matches!(
-                b.client_route.to_lowercase().as_str(),
-                "openai" | "gpt" | "chatgpt"
-            );
-            if !skip_base_url && !emitted_export_vars.contains(base_url_var) {
+            // 🔴 Do NOT special-case any route out of this export.
+            //
+            // Until 2026-09-11 the openai/gpt/chatgpt routes deliberately
+            // SKIPPED `OPENAI_BASE_URL` here. The stated reason was "Codex
+            // v0.118+ warns when OPENAI_BASE_URL is set, because it reads
+            // openai_base_url from ~/.codex/config.toml instead" — true for
+            // Codex's own model requests, but WRONG about the scope of this
+            // file: active.env is the contract every OpenAI-SDK consumer reads
+            // (Codex's image tool, python scripts, anything else in the shell).
+            // With the key exported as the `aikey_active_*` sentinel but no
+            // base URL, those consumers fell back to https://api.openai.com/v1
+            // and sent the sentinel string as if it were a real key — a 401
+            // that reads as "your key is invalid" and sends users off to rotate
+            // a perfectly good key. Worse, the natural self-fix is to paste a
+            // REAL provider key into OPENAI_API_KEY, which takes the traffic
+            // out of aikey's accounting, quota and DLP entirely.
+            //
+            // The invariant: `*_API_KEY` and `*_BASE_URL` are exported as a
+            // PAIR, for every route, exactly as `aikey run` already does
+            // (executor.rs build_run_env). Half a pair is worse than neither.
+            //
+            // Before re-introducing any skip: the deprecation warning was
+            // re-tested on Codex 0.153.4 (2026-09-11) and could not be
+            // reproduced — the string OPENAI_BASE_URL does not appear in any
+            // warning in that binary, and an A/B run differing only in that
+            // variable produced byte-identical output. If a future Codex warns
+            // again, fix it on the Codex-config side; do not break the pair.
+            //
+            // bugfix: workflow/CI/bugfix/20260911-openai-base-url-not-exported-breaks-image-generation.md
+            // fence: active_env_exports_base_url_for_every_route
+            if !emitted_export_vars.contains(base_url_var) {
                 upsert_active_export(
                     &mut env_lines,
                     &mut flat_pairs,
