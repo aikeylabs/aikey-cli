@@ -805,6 +805,14 @@ pub fn unconfigure_kimi_cli() -> tp::SurfaceOutcome {
 // (ChatGPT OAuth token or piped API key). Also `OPENAI_BASE_URL` env var is not
 // supported at all (only `openai_base_url` in config.toml).
 //
+// 🔴 That last sentence is about CODEX, and is not a reason for aikey to stop
+// exporting OPENAI_BASE_URL. Reading it as one cost a user 13 hours: active.env
+// is the surface EVERY OpenAI-SDK consumer in the shell reads (Codex's image
+// tool, python scripts), and with the `aikey_active_openai` sentinel exported
+// but no base URL they left aikey for api.openai.com and sent the sentinel as
+// a real key. Codex not reading a variable says nothing about who else does.
+// bugfix: workflow/CI/bugfix/20260911-openai-base-url-not-exported-breaks-image-generation.md
+//
 // We define a custom provider `[model_providers.aikey]` whose ONLY credential
 // channel is `experimental_bearer_token`. Writing `env_key` alongside it is
 // FORBIDDEN — see the short-circuit note below.
