@@ -1312,9 +1312,19 @@ pub enum PortReconcileOutcome {
 /// with no CLI in the loop, so a pure event hook would miss it.
 ///
 /// Staleness is judged across ALL local surfaces (`written_local_baseurl_ports`),
-/// not just active.env: openai routes deliberately skip the OPENAI_BASE_URL
-/// env export (Codex v0.118+ reads `~/.codex/config.toml` instead), so an
-/// openai-only user's ONLY port-carrying surface is the codex toml.
+/// not just active.env, because a surface can drift on its own: a third party
+/// re-serialises ~/.codex/config.toml, or the Desktop profile is edited by hand,
+/// while active.env still carries the right port.
+///
+/// This paragraph used to say something stronger and now-false: that an
+/// openai-only user's ONLY port-carrying surface was the codex toml, because
+/// openai routes skipped the OPENAI_BASE_URL env export. That skip is gone
+/// (2026-09-11) — active.env now carries a port for every bound route, so this
+/// guard sees openai drift there too. Kept as a note rather than deleted
+/// because the old sentence would otherwise read as a live invariant to anyone
+/// reasoning about which surface is authoritative.
+/// bugfix: workflow/CI/bugfix/20260911-openai-base-url-not-exported-breaks-image-generation.md
+///
 /// Cluster-node URLs (non-127.0.0.1) are never compared — drift must not
 /// rewrite cluster direct-bind routes.
 pub fn reconcile_baseurl_port() -> PortReconcileOutcome {
