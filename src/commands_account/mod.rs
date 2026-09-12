@@ -9627,8 +9627,8 @@ mod core_tests {
     /// bugfix: workflow/CI/bugfix/20260911-openai-base-url-not-exported-breaks-image-generation.md
     #[test]
     fn codex_tools_note_fires_only_for_api_key_bindings() {
-        use crate::credential_type::CredentialType;
         use crate::commands_account::credential_reaches_codex_backend as reaches;
+        use crate::credential_type::CredentialType;
 
         // API key → api.openai.com → no server-side tools → warn.
         assert!(
@@ -9653,7 +9653,10 @@ mod core_tests {
         );
         // 🔴 The shape a real user had: pool-backed VK. Silence required.
         assert!(
-            reaches(&CredentialType::ManagedVirtualKey, Some("grp-sso-feishu-01")),
+            reaches(
+                &CredentialType::ManagedVirtualKey,
+                Some("grp-sso-feishu-01")
+            ),
             "an OAuth-pool VK reaches the codex backend — warning here would be a \
              false alarm on a setup whose image generation demonstrably works"
         );
