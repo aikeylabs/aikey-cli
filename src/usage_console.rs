@@ -50,6 +50,10 @@ pub struct RouteTotal {
     pub tokens: i64,
     pub requests: i64,
     pub cost_usd: f64,
+    /// How many of `requests` carried NO price, so `cost_usd` does not cover
+    /// them. See `ConsoleUsage::unpriced_requests` for why this is an Option.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unpriced_requests: Option<i64>,
     /// Hourly series for THIS route (variant B). Empty when the console
     /// predates group_by=provider — the panel then falls back to variant A
     /// (receded machine chart) with no special-casing.
@@ -70,6 +74,33 @@ pub struct ConsoleUsage {
     pub requests: i64,
     /// USD across priced rows only; providers without price data add nothing.
     pub cost_usd: f64,
+    /// How many of `requests` carried NO price — the count that makes
+    /// `cost_usd` readable instead of misleading.
+    ///
+    /// bugfix: workflow/CI/bugfix/2026-09-12-app-cost-hides-unpriced-share.md
+    ///
+    /// 🔴 WHY IT EXISTS (2026-09-12, user report "这个价格计算是不是不对").
+    /// The panel showed `$0.00658 · 95 requests` while the web console showed the
+    /// same traffic as `$1.8010` with a red `151 unpriced` beside it. Both numbers
+    /// were arithmetically right; only the web one was READABLE, because only it
+    /// said how much of the traffic the money covers. A partial sum presented as a
+    /// total is worse than no number — and this panel's audience is explicitly the
+    /// non-technical end user.
+    ///
+    /// 🔴 WHY Option AND NOT 0. Absent means NOT REPORTED (a console predating
+    /// the by-protocol/total endpoint, or a fetch that failed); zero means
+    /// MEASURED, AND EVERYTHING WAS PRICED. Collapsing the two would make an old
+    /// console claim price coverage it never verified — the same class of lie this
+    /// field exists to remove. The view must render the two differently.
+    ///
+    /// 🔴 WHY A SEPARATE CALL rather than a field on `hourly`. The hourly endpoint
+    /// (`HourlyPoint`) has never carried the priced/unpriced split — it lives on
+    /// the `*Total` breakdowns, and `/by-protocol/total` is the exact endpoint the
+    /// WEB console reads to render its warning. Reusing it keeps ONE source of
+    /// truth for "how much of this is priced" across both surfaces, and needs no
+    /// server change in any of the four editions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unpriced_requests: Option<i64>,
     /// The zone the hours are bucketed in, so the axis can say what it means.
     pub time_zone: String,
     /// Today's totals per client route — the data behind the panel's
@@ -301,6 +332,20 @@ pub fn today_hourly() -> ConsoleUsage {
         fold_grouped_rows(&mut acc, &body);
     }
 
+    // The priced/unpriced split — see fold_protocol_totals. Same window as the
+    // hourly call above (one day, start == end), same best-effort contract.
+    let mut totals_url = format!(
+        "http://127.0.0.1:{}/api/user/usage/personal/by-protocol/total?scope=all&account_id={}&start_date={}&end_date={}",
+        port, account.account_id, today, today
+    );
+    if let Some(z) = &zone {
+        totals_url.push_str("&tz=");
+        totals_url.push_str(z);
+    }
+    if let Ok(body) = crate::local_server_probe::ureq_get_with_timeout(&totals_url, 2) {
+        fold_protocol_totals(&mut out, &mut acc, &body);
+    }
+
     merge_team_slice(&mut out, &mut acc, port, &today, zone.as_deref());
 
     for rt in acc.values_mut() {
@@ -308,6 +353,69 @@ pub fn today_hourly() -> ConsoleUsage {
     }
     out.by_route = acc.into_values().collect();
     out
+}
+
+/// Folds `/by-protocol/total` rows into the machine total and per-route totals.
+///
+/// spec: R-desktop-resilience-17 金额必须自带覆盖度.S3 覆盖度取数覆盖机器的两个半边
+///   workflow/CI/requirements/openspec/specs/desktop-resilience/spec.md
+///
+/// 🔴 WHY THIS CALL EXISTS AT ALL (2026-09-12). `cost_usd` alone is not a
+/// readable number: it covers PRICED rows only, and the panel had no way to say
+/// how many rows that left out. The web console has always been able to —
+/// it reads `/by-protocol/total`, whose `unpriced_request_count` is what renders
+/// its red "N unpriced" warning. The panel read `hourly` instead, whose
+/// `HourlyPoint` has never carried the split, so the caveat could not cross the
+/// wire at any price. This reads the SAME endpoint the web does rather than
+/// adding the field to `hourly`, so the two surfaces cannot disagree about how
+/// much of a bill is covered, and no server in any of the four editions changes.
+///
+/// 🔴 BEST-EFFORT, like every other secondary call here: a console that predates
+/// the endpoint, or a slow one, leaves `unpriced_requests` as None. None is
+/// "not reported", NOT "nothing was unpriced" — the view must not render them
+/// the same, or an old console would silently claim full price coverage.
+///
+/// The protocol axis is folded into the CLIENT ROUTE axis through the same one
+/// registry mapping `fold_grouped_rows` uses, never a second copy of it.
+fn fold_protocol_totals(
+    out: &mut ConsoleUsage,
+    acc: &mut std::collections::BTreeMap<String, RouteTotal>,
+    body: &str,
+) {
+    #[derive(serde::Deserialize)]
+    struct ProtocolTotalRow {
+        #[serde(default)]
+        protocol_type: String,
+        #[serde(default)]
+        unpriced_request_count: i64,
+    }
+    let rows: Vec<ProtocolTotalRow> = match serde_json::from_str(body) {
+        Ok(r) => r,
+        // A console that does not serve this endpoint answers with something
+        // that is not this shape. Leave None: saying nothing beats saying zero.
+        Err(_) => return,
+    };
+    // An EMPTY array is a real answer ("no traffic in this window"), so the
+    // total becomes Some(0) rather than staying unknown. Only a failure above
+    // leaves None.
+    *out.unpriced_requests.get_or_insert(0) +=
+        rows.iter().map(|r| r.unpriced_request_count).sum::<i64>();
+    for r in rows {
+        if r.protocol_type.is_empty() {
+            continue; // no axis to join on
+        }
+        let canonical = crate::commands_account::oauth_provider_to_canonical(&r.protocol_type);
+        let route = crate::provider_registry::client_route_for_binding(canonical, "").to_string();
+        let e = acc.entry(route.clone()).or_insert_with(|| RouteTotal {
+            route,
+            tokens: 0,
+            requests: 0,
+            cost_usd: 0.0,
+            unpriced_requests: None,
+            series: Vec::new(),
+        });
+        *e.unpriced_requests.get_or_insert(0) += r.unpriced_request_count;
+    }
 }
 
 /// Folds `group_by=provider` hourly rows into per-CLIENT-ROUTE totals.
@@ -340,6 +448,7 @@ fn fold_grouped_rows(acc: &mut std::collections::BTreeMap<String, RouteTotal>, b
                 tokens: 0,
                 requests: 0,
                 cost_usd: 0.0,
+                unpriced_requests: None,
                 series: Vec::new(),
             });
             e.tokens += r.total_tokens;
@@ -476,6 +585,22 @@ fn merge_team_slice(
     if let Ok(gbody) = crate::local_server_probe::ureq_get_with_timeout(&grouped, 3) {
         fold_grouped_rows(acc, &gbody);
     }
+
+    // The team half's priced/unpriced split, folded into the SAME accumulator as
+    // the local half — for the same reason the grouped call was extracted in
+    // 2026-08-21: a caveat that covers only half the headline is its own kind of
+    // wrong number.
+    let mut totals = format!(
+        "http://127.0.0.1:{}/v1/usage/personal/by-protocol/total?seat_id={}&start_date={}&end_date={}",
+        port, seat, today, today
+    );
+    if let Some(z) = zone {
+        totals.push_str("&tz=");
+        totals.push_str(z);
+    }
+    if let Ok(tbody) = crate::local_server_probe::ureq_get_with_timeout(&totals, 3) {
+        fold_protocol_totals(out, acc, &tbody);
+    }
 }
 
 #[cfg(test)]
@@ -587,6 +712,83 @@ mod scope_wiring_tests {
     }
 
     #[test]
+    /// The priced/unpriced split rides TWO more fetches, and both are exposed to
+    /// the same two traps the hourly pair already learned the hard way.
+    ///
+    /// 🔴 Trap 1 — an unnamed window (bugfix 2026-08-20). These endpoints share
+    /// their parameter parsing with the multi-day timeline, whose default range
+    /// starts 30 DAYS back. A fetch that forgets the window does not fail; it
+    /// answers for a different period, and the panel prints that beside today's
+    /// token count as though the two agreed.
+    ///
+    /// 🔴 Trap 2 — the wrong key (2026-08-21). The team server keys member usage
+    /// by `seat_id`; asking it for `account_id` returns `[]`, which is not an
+    /// error but a convincing "nothing was unpriced". The caveat would then go
+    /// silent on exactly the traffic it exists to qualify.
+    ///
+    /// Source-level for the same reason as the fences above: the URLs are
+    /// `format!` literals, and a behavioural test would need a whole
+    /// local-server plus a team server behind it.
+    /// bugfix: workflow/CI/bugfix/2026-09-12-app-cost-hides-unpriced-share.md
+    #[test]
+    fn both_unpriced_fetches_name_the_window_and_use_the_right_key() {
+        let src = include_str!("usage_console.rs");
+        // Runtime-assembled needles: include_str! reads THIS file, so a literal
+        // would match itself and inflate every count below.
+        // The trailing `?` is what keeps PROSE out of the count: the prose above
+        // names the endpoint several times, only a real URL carries a query.
+        let path = format!("by-protocol/{}?", "total");
+        let n = src.matches(path.as_str()).count();
+        assert_eq!(
+            n, 2,
+            "expected exactly TWO by-protocol/total fetches (local half + team half), found {n}. \
+             One fetch means the caveat covers half the headline, which is its own wrong number."
+        );
+        for key in [format!("{}_date=", "start"), format!("{}_date=", "end")] {
+            let c = src.matches(key.as_str()).count();
+            assert_eq!(
+                c, 2,
+                "expected both unpriced fetches to pin {key}, found {c}. Without an explicit \
+                 window the server answers for a 30-day default and the panel prints it beside \
+                 today's tokens as though they agreed."
+            );
+        }
+        // The local half asks by account, the team half by seat. Swap them and
+        // the team server answers [] — a silent "nothing unpriced".
+        // Assembled the same way, and for the same reason: a literal here would
+        // be counted as a third fetch by the assertion above. (It was, once.)
+        let local = format!(
+            "usage/personal/{}?scope=all&account_id=",
+            &path[..path.len() - 1]
+        );
+        let team = format!("v1/usage/personal/{}?seat_id=", &path[..path.len() - 1]);
+        assert!(
+            src.contains(local.as_str()),
+            "the LOCAL unpriced fetch no longer keys on account_id"
+        );
+        assert!(
+            src.contains(team.as_str()),
+            "the TEAM unpriced fetch no longer keys on seat_id — asking the team server by \
+             account_id returns [], which renders as 'nothing was unpriced'"
+        );
+
+        // 🔴 BUILDING A URL IS NOT FETCHING IT. The assertions above all passed
+        // while the team half's fetch had been re-pointed at another variable —
+        // the string was still in the file, unused. This module already learned
+        // the same lesson once ("Defining is not installing"); pin the CALL.
+        for (call, half) in [
+            (format!("get_with_timeout(&totals_url, {})", 2), "local"),
+            (format!("get_with_timeout(&totals, {})", 3), "team"),
+        ] {
+            assert!(
+                src.contains(call.as_str()),
+                "the {half} half builds its unpriced URL but no longer FETCHES it ({call} is \
+                 gone). The caveat then covers only the other half of the headline, which is \
+                 its own wrong number — and nothing else in this file would notice."
+            );
+        }
+    }
+
     fn both_hourly_fetches_name_the_day() {
         let src = include_str!("usage_console.rs");
         // Same runtime-assembled needle trick as above: include_str! reads
