@@ -8136,6 +8136,9 @@ pub fn handle_key_use(
                 crate::symbols::REFRESH.s()
             );
         }
+        if let Some(note) = codex_server_side_tools_note(&bindings) {
+            println!("{}", note);
+        }
         println!();
     }
 
@@ -8152,6 +8155,83 @@ pub fn handle_key_use(
 /// looking up an arbitrary representative row here can select another protocol.
 fn resolve_binding_protocol(b: &storage::ProviderBinding) -> String {
     crate::profile_activation::resolve_binding_protocol(b)
+}
+
+/// Client routes whose traffic is what Codex sends. Kept as one list because
+/// the answer below is a property of the DESTINATION, not of any one route
+/// name, and a second copy of this set is how the two would drift.
+const CODEX_CLIENT_ROUTES: &[&str] = &["openai", "gpt", "chatgpt"];
+
+/// Whether a credential's traffic reaches `chatgpt.com/backend-api/codex`
+/// rather than `api.openai.com/v1` — which decides whether Codex is offered
+/// the tools its own backend injects.
+///
+/// Why this matters enough to warn about (2026-09-11/12, measured on two
+/// machines): the Codex backend injects a server-side tool suite into
+/// `/responses` — built-in image generation and web search among them. The
+/// generic Responses API does not. So an API-key binding silently costs the
+/// user roughly half of Codex's tools, with no error anywhere: they simply ask
+/// for an image and are told the generator "isn't available in this session".
+/// One such case burned 13 hours before anyone suspected the credential TYPE.
+///
+/// 🔴 Two OAuth shapes, and missing the second is how this predicate would
+/// fire on a working setup:
+///   • `PersonalOAuthAccount` — the user ran `aikey auth login codex`.
+///   • a managed VK backed by an OAuth POOL, which is stored as
+///     `ManagedVirtualKey` and is OAuth only by virtue of a non-empty
+///     `oauth_group_id` (server-authoritative, synced into the VK cache).
+/// A real user's binding is the second shape. Judging by `CredentialType`
+/// alone would have told them their working Codex was crippled.
+///
+/// 🚫 Do NOT reach for the `group_of` helper in the `aikey use` presenter: that
+/// reports `route_group_name`, the failover-chain axis, which is a different
+/// concept that merely reads like this one.
+///
+/// Mirrors the proxy's own lane choice (`oauthUpstreamBase` → OAuth credentials
+/// go to the compiled-in codex upstream); if that ever stops being true, this
+/// message becomes a lie and must move with it.
+pub(crate) fn credential_reaches_codex_backend(
+    credential: &crate::credential_type::CredentialType,
+    oauth_group_id: Option<&str>,
+) -> bool {
+    credential.is_oauth() || oauth_group_id.is_some_and(|g| !g.trim().is_empty())
+}
+
+/// The advisory `aikey use` prints when the new binding leaves Codex without
+/// its backend-injected tools. `None` = nothing to say.
+///
+/// Advisory only, never blocking: the binding is valid and everything except
+/// those tools works. Per the UX ordering, an unhelpful default must be
+/// visible, not fatal.
+///
+/// Silence on an unreadable VK cache is deliberate. The note is an extra, while
+/// a WRONG note ("your Codex is degraded") aimed at someone whose Codex is fine
+/// is worse than no note at all — so an unknown answer stays quiet rather than
+/// guessing toward alarm.
+///
+/// bugfix: workflow/CI/bugfix/20260911-openai-base-url-not-exported-breaks-image-generation.md
+/// fence: codex_tools_note_fires_only_for_api_key_bindings
+fn codex_server_side_tools_note(bindings: &[storage::ProviderBinding]) -> Option<String> {
+    let b = bindings.iter().find(|b| {
+        CODEX_CLIENT_ROUTES
+            .iter()
+            .any(|r| b.client_route.eq_ignore_ascii_case(r))
+    })?;
+    let oauth_group_id = storage::get_virtual_key_cache(&b.key_source_ref)
+        .ok()
+        .flatten()
+        .and_then(|e| e.oauth_group_id);
+    if credential_reaches_codex_backend(&b.key_source_type, oauth_group_id.as_deref()) {
+        return None;
+    }
+    Some(format!(
+        "  \u{25b2} Codex's built-in image generation and web search stay off with this \
+         credential.\n     Those tools are injected by the Codex backend, which only serves \
+         ChatGPT-subscription\n     credentials; an API key routes to api.openai.com, which \
+         does not offer them. Everything\n     else works.\n     Enable: {}, then: {}",
+        "aikey auth login codex".cyan(),
+        "aikey use <that account>".cyan()
+    ))
 }
 
 /// Classify the `aikey use` summary line so it never overpromises
@@ -9532,6 +9612,54 @@ mod core_tests {
                  the later line wins, so one of the two is a lie: {env}"
             );
         }
+    }
+
+    /// Fence: the "Codex loses its built-in tools" advisory fires for API-key
+    /// bindings and STAYS SILENT for every OAuth shape.
+    ///
+    /// The pool case is the one that matters. An OAuth-pool VK is stored as
+    /// `ManagedVirtualKey` and is OAuth only by virtue of a non-empty
+    /// `oauth_group_id`; a predicate written off `CredentialType` alone passes
+    /// the two obvious cases and then tells a real user with a working Codex
+    /// that it is degraded. A false alarm on a healthy setup is the expensive
+    /// failure here, not a missed one.
+    ///
+    /// bugfix: workflow/CI/bugfix/20260911-openai-base-url-not-exported-breaks-image-generation.md
+    #[test]
+    fn codex_tools_note_fires_only_for_api_key_bindings() {
+        use crate::commands_account::credential_reaches_codex_backend as reaches;
+        use crate::credential_type::CredentialType;
+
+        // API key → api.openai.com → no server-side tools → warn.
+        assert!(
+            !reaches(&CredentialType::PersonalApiKey, None),
+            "an API key does not reach the codex backend"
+        );
+        // Direct-bind managed VK carries key material, not a subscription.
+        assert!(
+            !reaches(&CredentialType::ManagedVirtualKey, None),
+            "a direct-bind VK does not reach the codex backend"
+        );
+        // A group id that is present but blank must not read as OAuth.
+        assert!(
+            !reaches(&CredentialType::ManagedVirtualKey, Some("   ")),
+            "a blank oauth_group_id is not an OAuth binding"
+        );
+
+        // Logged-in ChatGPT account.
+        assert!(
+            reaches(&CredentialType::PersonalOAuthAccount, None),
+            "a personal OAuth account reaches the codex backend"
+        );
+        // 🔴 The shape a real user had: pool-backed VK. Silence required.
+        assert!(
+            reaches(
+                &CredentialType::ManagedVirtualKey,
+                Some("grp-sso-feishu-01")
+            ),
+            "an OAuth-pool VK reaches the codex backend — warning here would be a \
+             false alarm on a setup whose image generation demonstrably works"
+        );
     }
 
     #[test]
