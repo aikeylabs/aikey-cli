@@ -232,8 +232,24 @@ pub(crate) fn start(interval_secs: u64) -> Result<(), String> {
         //    clusters → ciphertext NULL → empty DE-proxy registry → 401s. Bug:
         //    20260611-form2-de-proxy-token-registry-mismatch.
         match run_full_snapshot_sync_for_agent(&password) {
-            Ok(0) => {} // nothing new
-            Ok(n) => println!("[agent] synced {n} key(s) into vault"),
+            // 🔴 A refusal is reported even when nothing new arrived. This arm
+            // used to be `Ok(0) => {}` — silent — which is precisely how an
+            // unattended daemon on a control plane that CANNOT deliver team keys
+            // looked identical to one that simply had nothing new. It keeps
+            // retrying either way (the refusal is not fatal); what changes is
+            // that an operator reading the log can see why the vault stays empty.
+            // Bug: workflow/CI/bugfix/20260907-team-key-delivery-is-silent-without-the-protected-module.md
+            Ok(o) if o.capability_refused.is_some() => {
+                let r = o.capability_refused.as_ref().unwrap();
+                eprintln!(
+                    "[agent] team keys not delivered: control plane cannot run `{}` ({}) — {}",
+                    r.capability,
+                    r.code,
+                    r.next_step()
+                );
+            }
+            Ok(o) if o.downloaded == 0 => {} // nothing new
+            Ok(o) => println!("[agent] synced {} key(s) into vault", o.downloaded),
             Err(e) => eprintln!("[agent] snapshot sync failed (retrying): {e}"),
         }
 
