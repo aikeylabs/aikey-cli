@@ -117,6 +117,7 @@ aikey web --copy-url                        # 复制带鉴权的 URL 而不是�
 aikey config time-zone Asia/Shanghai        # 北京 / 上海,中国标准时间
 aikey config time-zone auto                 # 跟随本设备系统时区
 aikey config language zh                    # 桌面托盘语言:auto / en / zh
+aikey config theme light                    # 桌面托盘主题:auto / light / dark
 
 # 维护
 aikey doctor                                # 诊断 PATH / hook / proxy / vault

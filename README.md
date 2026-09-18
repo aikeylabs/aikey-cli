@@ -117,6 +117,7 @@ aikey web --copy-url                        # copy the authed URL instead of ope
 aikey config time-zone Asia/Shanghai        # Beijing / Shanghai, China Standard Time
 aikey config time-zone auto                 # follow this device's system time zone
 aikey config language zh                    # desktop tray language: auto / en / zh
+aikey config theme light                    # desktop tray theme: auto / light / dark
 
 # Maintenance
 aikey doctor                                # diagnose PATH / hook / proxy / vault
