@@ -2455,6 +2455,7 @@ mod team_status_overlay_tests {
 
     fn vk(id: &str, ciphertext: Option<&[u8]>) -> storage::VirtualKeyCacheEntry {
         storage::VirtualKeyCacheEntry {
+            route_kind: String::new(),
             binding_id: String::new(),
             priority: 1,
             fallback_role: "primary".to_string(),

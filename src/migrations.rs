@@ -670,6 +670,36 @@ pub mod v1_0_0_baseline {
                 "route_group_name",
                 "ALTER TABLE managed_virtual_keys_cache ADD COLUMN route_group_name TEXT NOT NULL DEFAULT ''",
             ),
+            // ── route_kind: WHICH KIND of route this row is ────────────────
+            //
+            // `'device_routing_token'` marks a device-routing token — the third
+            // kind of AiKey token, whose account the control plane decides per
+            // employee DEVICE and hands the worker in an internal header
+            // (design.md §4b.7, R-device-routing-token-dispatch-20). Empty means
+            // an ordinary token.
+            //
+            // 🔴 DEFAULT '' reproduces pre-upgrade behavior EXACTLY: every
+            // existing row becomes "not a device-routing token", which is what
+            // every row was before this feature existed. The worker refuses the
+            // strict branch on an empty kind instead of guessing
+            // (R-device-routing-token-dispatch-20.S2), so an upgraded-but-not-yet
+            // re-synced node fails CLOSED and loudly rather than silently
+            // serving such a token down the seat path. An upgrade must not alter
+            // routing on its own.
+            //
+            // Additive + online-upgrade safe, same as every column above: no
+            // rebuild, no rewrite of existing rows, and an older binary that
+            // never heard of route kinds simply never selects it. `ensure_column`
+            // makes it idempotent (SQLite has no ADD COLUMN IF NOT EXISTS).
+            //
+            // ⚠️ Also listed in the P1e re-grain rebuild below — a pre-P1e vault
+            // reaches that block with this column already added, and the rebuild
+            // copies by EXPLICIT column list, so leaving it out there would drop
+            // the column again on exactly the oldest vaults.
+            (
+                "route_kind",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN route_kind TEXT NOT NULL DEFAULT ''",
+            ),
         ] {
             ensure_column(conn, "managed_virtual_keys_cache", col, ddl)?;
         }
@@ -747,6 +777,7 @@ pub mod v1_0_0_baseline {
                     route_group_id         TEXT NOT NULL DEFAULT '',
                     route_group_name       TEXT NOT NULL DEFAULT '',
                     binding_id             TEXT NOT NULL DEFAULT '',
+                    route_kind             TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (virtual_key_id, protocol_type, provider_code)
                 );
                  INSERT INTO managed_virtual_keys_cache__p1e_new (
@@ -760,7 +791,7 @@ pub mod v1_0_0_baseline {
                     extra, oauth_group_id, group_accounts, routing_config,
                     my_assignment_override, group_runtime, owner_email, group_alias,
                     priority, fallback_role, route_group_id, route_group_name,
-                    binding_id
+                    binding_id, route_kind
                  )
                  SELECT
                     virtual_key_id, org_id, seat_id, alias,
@@ -773,7 +804,7 @@ pub mod v1_0_0_baseline {
                     extra, oauth_group_id, group_accounts, routing_config,
                     my_assignment_override, group_runtime, owner_email, group_alias,
                     priority, fallback_role, route_group_id, route_group_name,
-                    binding_id
+                    binding_id, route_kind
                  FROM managed_virtual_keys_cache;
                  DROP TABLE managed_virtual_keys_cache;
                  ALTER TABLE managed_virtual_keys_cache__p1e_new RENAME TO managed_virtual_keys_cache;",

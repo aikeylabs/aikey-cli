@@ -1641,6 +1641,7 @@ mod tests {
 
         // 1a. team VK（acct-1 所有，active）——客户机上就是 key-damonlee1020-…
         let entry = crate::storage::VirtualKeyCacheEntry {
+            route_kind: String::new(),
             binding_id: String::new(),
             virtual_key_id: "vk-cust".into(),
             org_id: "org-1".into(),
@@ -1970,6 +1971,7 @@ mod tests {
     /// helper: 一条 active team VK + anthropic binding（多用例共用）。
     fn seed_active_vk_with_binding() {
         let entry = crate::storage::VirtualKeyCacheEntry {
+            route_kind: String::new(),
             binding_id: String::new(),
             virtual_key_id: "vk-healthy".into(),
             org_id: "org-1".into(),

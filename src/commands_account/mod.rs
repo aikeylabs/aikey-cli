@@ -4507,6 +4507,7 @@ mod status_candidates_tests {
         providers: &[&str],
     ) -> crate::storage::VirtualKeyCacheEntry {
         crate::storage::VirtualKeyCacheEntry {
+            route_kind: String::new(),
             binding_id: format!("b-{vk_id}-{}", providers.join("-")),
             virtual_key_id: vk_id.to_string(),
             org_id: "org".into(),
@@ -5068,6 +5069,19 @@ fn apply_snapshot_to_cache(
                 )
             });
 
+        // route_kind carry-forward (design §4b.7). The MEMBER snapshot does not
+        // carry the route's kind — only the cluster delivery bundle does — and
+        // the upsert refreshes the column on conflict, so writing a blank here
+        // would CLEAR a device-routing token's kind on the next poll. The worker
+        // then refuses that token's traffic with 503 `route_kind_missing`
+        // (R-device-routing-token-dispatch-20.S2): a loud failure, but caused by
+        // this writer rather than by anything wrong upstream. Empty for a new row
+        // = "an ordinary token", which is what every member-rail key is.
+        let existing_route_kind = existing
+            .as_ref()
+            .map(|e| e.route_kind.clone())
+            .unwrap_or_default();
+
         let local_state = compute_local_state_from_effective(
             &item.effective_status,
             &item.effective_reason,
@@ -5094,6 +5108,8 @@ fn apply_snapshot_to_cache(
             // snapshot does not carry hop identity, and blanking it would strip
             // cooldown/stickiness of the id they key on.
             binding_id: existing_chain.4.clone(),
+            // Same carry-forward posture — see existing_route_kind above.
+            route_kind: existing_route_kind,
             protocol_type: item.protocol_type.clone(),
             base_url: item.base_url.clone(),
             credential_id: item.credential_id.clone(),
@@ -5494,6 +5510,16 @@ pub(crate) fn upsert_delivered_key(
         group_accounts: existing.as_ref().and_then(|e| e.group_accounts.clone()),
         routing_config: existing.as_ref().and_then(|e| e.routing_config.clone()),
         group_alias: existing.as_ref().and_then(|e| e.group_alias.clone()),
+        // route_kind: carried forward for the same reason (design §4b.7). This
+        // is the DIRECT-BIND accept path; a `DeliveredKey` has no route kind to
+        // give, and the upsert refreshes the column on conflict, so a blank here
+        // would clear a device-routing token's kind and make the worker refuse
+        // its traffic (R-device-routing-token-dispatch-20.S2). Empty for a new
+        // row = "an ordinary token".
+        route_kind: existing
+            .as_ref()
+            .map(|e| e.route_kind.clone())
+            .unwrap_or_default(),
     };
     storage::upsert_virtual_key_cache(&entry)
 }
@@ -6157,6 +6183,13 @@ pub fn sync_managed_key_metadata() -> bool {
                 group_accounts: existing.and_then(|e| e.group_accounts.clone()),
                 routing_config: existing.and_then(|e| e.routing_config.clone()),
                 group_alias: existing.and_then(|e| e.group_alias.clone()),
+                // route_kind: preserved for the same reason (design §4b.7). This
+                // lightweight metadata endpoint does not carry the route's kind,
+                // and the upsert refreshes the column on conflict — so blanking
+                // it here would clear a device-routing token's kind and make the
+                // worker refuse its traffic
+                // (R-device-routing-token-dispatch-20.S2).
+                route_kind: existing.map(|e| e.route_kind.clone()).unwrap_or_default(),
             };
             if let Err(error) = storage::upsert_virtual_key_cache(&entry) {
                 eprintln!(
@@ -9462,6 +9495,7 @@ mod core_tests {
         routing_config: Option<&str>,
     ) -> storage::VirtualKeyCacheEntry {
         storage::VirtualKeyCacheEntry {
+            route_kind: String::new(),
             binding_id: String::new(),
             priority: 1,
             fallback_role: "primary".to_string(),
@@ -11685,6 +11719,7 @@ mod sync_prune_tests {
 
     fn cache_entry(vk_id: &str, owner: &str) -> storage::VirtualKeyCacheEntry {
         storage::VirtualKeyCacheEntry {
+            route_kind: String::new(),
             binding_id: String::new(),
             priority: 1,
             fallback_role: "primary".to_string(),

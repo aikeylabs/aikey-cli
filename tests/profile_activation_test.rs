@@ -99,6 +99,7 @@ fn setup() -> TestEnvGuard {
 /// unreachable_team_vk and friends).
 fn reachable_team_vk(vk: &str) {
     let entry = storage::VirtualKeyCacheEntry {
+        route_kind: String::new(),
         binding_id: String::new(),
         virtual_key_id: vk.into(),
         org_id: "org-1".into(),

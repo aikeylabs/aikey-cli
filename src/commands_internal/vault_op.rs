@@ -370,6 +370,28 @@ struct ClusterVk {
     /// upgrades; an explicit empty value means clear a stale assignment.
     #[serde(default)]
     assignment_override: Option<ClusterAssignmentOverride>,
+    /// WHICH KIND of route this key is: `"device_routing_token"` marks a
+    /// device-routing token, whose account the control plane decides per
+    /// employee device and hands the worker in an internal header. Empty means
+    /// an ordinary token — and that is the only correct reading of "absent",
+    /// because the worker's strict branch must never be reached by inference
+    /// (R-device-routing-token-dispatch-20).
+    ///
+    /// 🔴 This daemon is hop ② of a six-hop HAND-COPIED relay (design §4b.7):
+    /// the control plane's bundle → here → `VirtualKeyCacheEntry` → the node
+    /// vault's `managed_virtual_keys_cache.route_kind` → the proxy's
+    /// `ManagedKey.RouteKind` → `ResolvedRoute.RouteKind`. Cluster worker
+    /// material reaches the node ONLY through this field-by-field copy, so a
+    /// forgotten line here is an empty value on the node, not an error — and
+    /// the worker then serves a device-routing token down the seat path and
+    /// picks its own account.
+    ///
+    /// `#[serde(default)]` is load-bearing: a cluster is upgraded control-plane
+    /// first, and an older bundle simply has no such field. Requiring it would
+    /// reject the WHOLE snapshot during the rolling window — `slots: null`
+    /// alone once took a cluster offline that way (bugfix 2026-07-16).
+    #[serde(default)]
+    route_kind: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -445,6 +467,29 @@ struct ClusterRuntimeAccount {
     /// chain.
     #[serde(default)]
     egress_proxy_url: String,
+    /// This ACCOUNT's Codex identity-rewrite key as the control plane derived
+    /// it: base64(std) of 32 bytes from `HKDF(MASTER_KEY, credential_id)`.
+    ///
+    /// spec: R-codex-identity-rewrite-4 控制面按账号派生专属密钥、随账号材料加密下发
+    /// roadmap20260320/技术实现/阶段9-商业化版本/codex-pool-anti-linkage/openspec/specs/codex-identity-rewrite/spec.md
+    ///
+    /// 🔴 This daemon is a hop of a HAND-COPIED relay: control assembly → this
+    /// field → `build_group_runtime_material` → the node vault's
+    /// `group_runtime.identity_key_{nonce,ciphertext}` → the proxy's
+    /// `GroupRuntimeAccount` → the resolved route. Cluster worker material
+    /// reaches the node ONLY through that field-by-field copy, so a forgotten
+    /// line here is an empty value on the node, not an error — and the worker
+    /// then rewrites with a key only IT can produce, so the same account looks
+    /// different on every node. Fence: aikey-test
+    /// `TestIdentityKey_RidesTheDaemonSpine`.
+    ///
+    /// Plaintext over TLS here (like `access_token`) and re-encrypted with the
+    /// node vault key before it touches disk. `#[serde(default)]` is
+    /// load-bearing for the same reason as `route_kind` on `ClusterVk`: a
+    /// cluster is upgraded control-plane first, and requiring the field would
+    /// reject the WHOLE snapshot during the rolling window.
+    #[serde(default)]
+    identity_key: String,
     /// seat_id → token. The apply projects member_tokens[token_seat_id] per VK.
     /// null-tolerant like the Vec fields: a Go nil map also wires as `null`.
     #[serde(default, deserialize_with = "null_to_default")]
@@ -708,6 +753,45 @@ fn build_group_runtime_material(
         if !a.egress_proxy_url.is_empty() {
             m.insert("egress_proxy_url".into(), a.egress_proxy_url.clone().into());
         }
+        // Per-account Codex identity-rewrite key (spec:
+        // R-codex-identity-rewrite-4). Encrypted with the SAME vault key and
+        // the same helper as the token below, into the same nonce/ciphertext
+        // base64(std) shape — there is deliberately no second crypto path.
+        //
+        // OUTSIDE the token match, exactly like egress_proxy_url above: the key
+        // belongs to the ACCOUNT, so a needs_login account carries it too and
+        // it is already in place the moment the parent member logs in.
+        //
+        // TWO failure modes, and they end differently on purpose — read as one,
+        // the `?` below looks like a bug:
+        //
+        //   * an undecodable base64 delivery is DOWNGRADED: only this account's
+        //     key is omitted and the snapshot still applies. Rejecting it would
+        //     take the whole node's material offline over a side feature (the
+        //     `slots: null` class of outage, bugfix 2026-07-16). The worker then
+        //     lands on its documented node-local fallback, which reports CRIT,
+        //     and the WARN here is what distinguishes "control sent junk" from
+        //     "control is older than this daemon".
+        //   * an ENCRYPT failure is fatal for the whole material, via the `?`.
+        //     Deliberately not downgraded: the token two lines down encrypts
+        //     through the very same `?`, so a vault that cannot encrypt leaves
+        //     no account with a usable token anyway — there is no partial state
+        //     worth salvaging, and a side feature must not invent a recovery
+        //     path the main material does not have.
+        if !a.identity_key.is_empty() {
+            match b64.decode(a.identity_key.as_bytes()) {
+                Ok(raw) if !raw.is_empty() => {
+                    let (nonce, ct) = crate::crypto::encrypt(key, &raw)?;
+                    m.insert("identity_key_nonce".into(), b64.encode(nonce).into());
+                    m.insert("identity_key_ciphertext".into(), b64.encode(ct).into());
+                }
+                _ => eprintln!(
+                    "[_internal cluster_apply WARN] account {} identity key is not usable base64; \
+                     omitting it (worker falls back to a node-local key and reports CRIT)",
+                    a.account_id
+                ),
+            }
+        }
         match a.member_tokens.get(token_seat) {
             Some(tok) if !tok.access_token.is_empty() => {
                 let (nonce, ct) = crate::crypto::encrypt(key, tok.access_token.as_bytes())?;
@@ -798,6 +882,13 @@ fn apply_group_vk(
         fallback_role: "primary".to_string(),
         route_group_id: String::new(),
         route_group_name: String::new(),
+        // Hop ② → ③ of the route_kind relay (design §4b.7). Carried verbatim
+        // from the delivery bundle, never derived from the row's shape: a
+        // device-routing token IS group-bound and slot-less, but so is every
+        // ordinary pool-backed agent VK, so inferring the kind here would
+        // classify them all as device-routing — fail-OPEN, which is the one
+        // outcome R-device-routing-token-dispatch-20 exists to prevent.
+        route_kind: vk.route_kind.clone(),
         protocol_type: vk.protocol_type.clone().unwrap_or_default(),
         base_url: String::new(), // group routing resolves per-account upstream, not via a static base_url
         credential_id: String::new(),
@@ -3387,6 +3478,7 @@ mod hook_envelope_tests {
                     window_7d_status: "active".into(),
                     window_7d_reset_at: None,
                     egress_proxy_url: "socks5://10.0.0.9:1080".into(),
+                    identity_key: String::new(),
                     member_tokens: tokens_a,
                 },
                 ClusterRuntimeAccount {
@@ -3405,6 +3497,7 @@ mod hook_envelope_tests {
                     window_7d_status: String::new(),
                     window_7d_reset_at: None,
                     egress_proxy_url: String::new(), // no override → falls back to node chain
+                    identity_key: String::new(),
                     member_tokens: std::collections::HashMap::new(), // parent never logged in
                 },
                 ClusterRuntimeAccount {
@@ -3423,6 +3516,7 @@ mod hook_envelope_tests {
                     window_7d_status: String::new(),
                     window_7d_reset_at: None,
                     egress_proxy_url: String::new(),
+                    identity_key: String::new(),
                     member_tokens: std::collections::HashMap::new(),
                 },
             ],
@@ -3489,6 +3583,128 @@ mod hook_envelope_tests {
         assert!(
             !wire.to_lowercase().contains("refresh"),
             "group_runtime wire must carry no refresh material: {wire}"
+        );
+    }
+
+    /// spec: R-codex-identity-rewrite-4 控制面按账号派生专属密钥、随账号材料加密下发
+    /// roadmap20260320/技术实现/阶段9-商业化版本/codex-pool-anti-linkage/openspec/specs/codex-identity-rewrite/spec.md
+    ///
+    /// This daemon hop is where the key has to survive a hand-written field
+    /// copy. The cross-process fence is aikey-test
+    /// `TestIdentityKey_RidesTheDaemonSpine` (real daemon + real node vault);
+    /// this unit test pins the same contract without a 50-second E2E: the at-
+    /// rest shape, the account-level (login-independent) placement, and the
+    /// omit-on-absence rule an older control plane depends on.
+    #[test]
+    fn group_runtime_material_carries_per_account_identity_key() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let key = [9u8; 32];
+        let delivered = [0x3fu8; 32];
+
+        let mut tokens = std::collections::HashMap::new();
+        tokens.insert(
+            "seat-parent".to_string(),
+            ClusterMemberToken {
+                access_token: "parent-token-AAA".into(),
+                provider_account_id: String::new(),
+                token_expires_at: 4200,
+            },
+        );
+        let account =
+            |account_id: &str,
+             credential_id: &str,
+             identity_key: String,
+             member_tokens: std::collections::HashMap<String, ClusterMemberToken>| {
+                ClusterRuntimeAccount {
+                    account_id: account_id.into(),
+                    credential_id: credential_id.into(),
+                    identity: String::new(),
+                    protocol_type: String::new(),
+                    base_url: String::new(),
+                    external_id: String::new(),
+                    priority: 1,
+                    enabled: true,
+                    window_max_util_pct: None,
+                    window_status: String::new(),
+                    window_reset_at: None,
+                    window_7d_max_util_pct: None,
+                    window_7d_status: String::new(),
+                    window_7d_reset_at: None,
+                    egress_proxy_url: String::new(),
+                    identity_key,
+                    member_tokens,
+                }
+            };
+        let g = ClusterRuntimeGroup {
+            oauth_group_id: "g-idk".into(),
+            provider_code: "openai".into(),
+            routing_config: "{}".into(),
+            accounts: vec![
+                account("acc-keyed", "cred-keyed", b64.encode(delivered), tokens),
+                // Parent never logged in: the key is still expected, because it
+                // belongs to the ACCOUNT (same rule as egress_proxy_url).
+                account(
+                    "acc-needs-login",
+                    "cred-needs-login",
+                    b64.encode(delivered),
+                    std::collections::HashMap::new(),
+                ),
+                // Older control plane: no key at all → fields must be OMITTED so
+                // the worker takes its documented fallback, not an empty value.
+                account(
+                    "acc-old-control",
+                    "cred-old-control",
+                    String::new(),
+                    std::collections::HashMap::new(),
+                ),
+            ],
+        };
+
+        let (_refs, material) =
+            build_group_runtime_material(&key, &g, "seat-parent").expect("project material");
+
+        for account_id in ["acc-keyed", "acc-needs-login"] {
+            let m = material[account_id].as_object().unwrap();
+            let nonce = b64
+                .decode(
+                    m.get("identity_key_nonce")
+                        .unwrap_or_else(|| {
+                            panic!("{account_id}: this hop dropped identity_key_nonce — the worker would rewrite with a node-local key")
+                        })
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+            let ct = b64
+                .decode(
+                    m.get("identity_key_ciphertext")
+                        .unwrap_or_else(|| {
+                            panic!("{account_id}: this hop dropped identity_key_ciphertext")
+                        })
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+            let plain = crate::crypto::decrypt(&key, &nonce, &ct).expect("decrypt identity key");
+            assert_eq!(
+                plain.to_vec(),
+                delivered.to_vec(),
+                "{account_id}: identity key must survive the vault round-trip byte-for-byte"
+            );
+        }
+
+        let old = material["acc-old-control"].as_object().unwrap();
+        assert!(
+            old.get("identity_key_nonce").is_none() && old.get("identity_key_ciphertext").is_none(),
+            "an account with no delivered key must be OMITTED, never written as empty material"
+        );
+
+        // The delivered key must never sit in the clear in the node material.
+        let wire = serde_json::Value::Object(material).to_string();
+        assert!(
+            !wire.contains(&b64.encode(delivered)),
+            "identity key leaked unencrypted into group_runtime"
         );
     }
 
@@ -3686,6 +3902,54 @@ mod hook_envelope_tests {
             p3.oauth_group_runtime.as_ref().expect("runtime").groups[0].accounts[0]
                 .member_tokens
                 .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+mod cluster_vk_route_kind_tests {
+    use super::*;
+
+    /// Hop ② of the `route_kind` relay chain: the delivery bundle's new
+    /// `route_kind` field must be parsed off the wire, and an OLD bundle that
+    /// does not carry it must still parse.
+    ///
+    /// Why both halves: the field is additive (design §4b, "新增 wire 字段全部
+    /// `omitempty`、只增不改"), and a cluster is upgraded control-plane-first.
+    /// A serde shape that required the field would reject the whole snapshot
+    /// during the rolling window — `slots: null` already took an entire cluster
+    /// offline this way (bugfix 2026-07-16), which is why the absent-field case
+    /// is fenced and not assumed.
+    ///
+    /// Spec: R-device-routing-token-dispatch-20
+    #[test]
+    fn cluster_vk_parses_route_kind_and_tolerates_its_absence() {
+        let with_kind: ClusterVk = serde_json::from_str(
+            r#"{"virtual_key_id":"vk-drt","owner_account_id":"acct-1","seat_id":"seat-drt",
+                 "key_status":"active","virtual_key_revision":"vr1",
+                 "oauth_group_id":"grp-1","protocol_type":"anthropic",
+                 "route_kind":"device_routing_token"}"#,
+        )
+        .expect("new-shape bundle must parse");
+        assert_eq!(
+            with_kind.route_kind, "device_routing_token",
+            "the daemon dropped route_kind at the wire boundary — every hop after this one \
+             would carry an empty classifier and the worker would serve a device-routing \
+             token down the seat path"
+        );
+
+        let old_shape: ClusterVk = serde_json::from_str(
+            r#"{"virtual_key_id":"vk-plain","owner_account_id":"acct-1","seat_id":"seat-1",
+                 "key_status":"active","virtual_key_revision":"vr1",
+                 "oauth_group_id":"grp-1","protocol_type":"anthropic"}"#,
+        )
+        .expect(
+            "an OLD control plane's bundle has no route_kind; rejecting it would fail the \
+             whole cluster snapshot during a rolling upgrade",
+        );
+        assert_eq!(
+            old_shape.route_kind, "",
+            "absent must mean \"not a device-routing token\", never a guessed value"
         );
     }
 }

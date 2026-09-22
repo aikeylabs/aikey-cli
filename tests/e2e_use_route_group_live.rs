@@ -72,6 +72,7 @@ fn hop(
     ciphertext: Vec<u8>,
 ) -> storage::VirtualKeyCacheEntry {
     storage::VirtualKeyCacheEntry {
+        route_kind: String::new(),
         virtual_key_id: vk_id.to_string(),
         org_id: "org-rg".to_string(),
         seat_id: "seat-rg".to_string(),

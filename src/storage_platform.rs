@@ -649,6 +649,22 @@ pub struct VirtualKeyCacheEntry {
     /// "primary" | "fallback". Derived from order upstream (I19) and carried
     /// here for display; ordering decisions must use `priority`.
     pub fallback_role: String,
+    /// WHICH KIND of route this row is: `"device_routing_token"` marks a
+    /// device-routing token, whose account the control plane decides per
+    /// employee device and hands the worker in an internal header. Empty means
+    /// an ordinary token, and empty is also what an old vault (or an old
+    /// daemon's insert) yields — deliberately the same value, because the
+    /// worker refuses the strict branch on an empty kind rather than guessing
+    /// (R-device-routing-token-dispatch-20.S2).
+    ///
+    /// 🔴 Hop ③ of a six-hop hand-copied relay (design §4b.7). It must be
+    /// written in ALL THREE parts of `upsert_virtual_key_cache`'s statement —
+    /// the INSERT column list, the placeholders, and
+    /// `ON CONFLICT … DO UPDATE SET`. Missing from the last one is the quiet
+    /// failure: the first sync writes the right value and it then freezes
+    /// forever, so a token that later stops (or starts) being a device-routing
+    /// token never updates on the node.
+    pub route_kind: String,
     /// Route-group template provenance (task 1.2b). Empty = legacy row, which
     /// keeps the pre-upgrade single-shot behavior.
     pub route_group_id: String,
@@ -799,6 +815,7 @@ mod servable_tests {
     /// （fixture 填了生产中不存在的 `local_state: "active"`）。
     fn entry(local_state: &str, key_status: &str) -> VirtualKeyCacheEntry {
         VirtualKeyCacheEntry {
+            route_kind: String::new(),
             binding_id: String::new(),
             virtual_key_id: "vk-1".into(),
             org_id: "org-1".into(),
@@ -1022,7 +1039,7 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              provider_base_urls, owner_account_id,
              oauth_group_id, group_accounts, routing_config, owner_email, group_alias,
              priority, fallback_role, route_group_id, route_group_name,
-             binding_id
+             binding_id, route_kind
          ) VALUES (
              ?1,  ?2,  ?3,  ?4,
              ?5,  ?6,  ?7,
@@ -1035,7 +1052,7 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              ?19, ?20,
              ?21, ?22, ?23, ?24, ?25,
              ?26, ?27, ?28, ?29,
-             ?30
+             ?30, ?31
          )
          ON CONFLICT(virtual_key_id, protocol_type, provider_code) DO UPDATE SET
              org_id                  = excluded.org_id,
@@ -1065,7 +1082,15 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              fallback_role           = excluded.fallback_role,
              route_group_id          = excluded.route_group_id,
              route_group_name        = excluded.route_group_name,
-             binding_id              = excluded.binding_id
+             binding_id              = excluded.binding_id,
+             route_kind              = excluded.route_kind
+             /* route_kind: server-synced, and 🔴 refreshing it on conflict is the
+                whole point — this row is upserted on every daemon poll. Left out
+                of this clause the FIRST sync would win forever: a VK that later
+                stops being a device-routing token (its token deleted and the
+                account pool rebound, design §4b.8) would keep its old kind on
+                the node, and one that becomes one would never get it. The
+                control plane is authoritative for the route's kind. */
              /* binding_id: server-synced for the same reason as the chain columns
                 — it is the hop's identity in the control plane's ledger, and a
                 re-sync must carry a re-issued binding's new id or cooldown,
@@ -1119,6 +1144,7 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
             entry.route_group_id,
             entry.route_group_name,
             entry.binding_id,
+            entry.route_kind,
         ],
     )
     .map_err(|e| format!("Failed to upsert virtual key cache: {}", e))?;
@@ -1216,7 +1242,7 @@ const VK_CACHE_COLUMNS_CHAIN: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
      provider_base_urls, owner_account_id, extra, oauth_group_id, group_accounts, routing_config, owner_email, group_runtime, group_alias, \
-     priority, fallback_role, route_group_id, route_group_name, binding_id";
+     priority, fallback_role, route_group_id, route_group_name, binding_id, route_kind";
 const VK_CACHE_COLUMNS_GROUP: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
      credential_id, credential_revision, virtual_key_revision, \
@@ -1225,7 +1251,7 @@ const VK_CACHE_COLUMNS_GROUP: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
      provider_base_urls, owner_account_id, extra, oauth_group_id, group_accounts, routing_config, owner_email, group_runtime, group_alias, \
-     1, 'primary', '', '', ''";
+     1, 'primary', '', '', '', ''";
 // Middle: real extra, no oauth_group columns yet (project NULL at 22/23).
 const VK_CACHE_COLUMNS_FULL: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
@@ -1235,7 +1261,7 @@ const VK_CACHE_COLUMNS_FULL: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
      provider_base_urls, owner_account_id, extra, NULL, NULL, NULL, NULL, NULL, NULL, \
-     1, 'primary', '', '', ''";
+     1, 'primary', '', '', '', ''";
 // Oldest: no extra, no oauth_group columns.
 const VK_CACHE_COLUMNS_LEGACY: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
@@ -1245,7 +1271,7 @@ const VK_CACHE_COLUMNS_LEGACY: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
      provider_base_urls, owner_account_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
-     1, 'primary', '', '', ''";
+     1, 'primary', '', '', '', ''";
 
 /// Single mapping from a SELECT row (in the column order declared by
 /// `VK_CACHE_COLUMNS_*` above) to a struct. Centralised here so adding
@@ -1307,6 +1333,12 @@ fn row_to_virtual_key_cache(row: &rusqlite::Row) -> rusqlite::Result<VirtualKeyC
         // absent entirely until 2026-07-31, which is why cooldown, stickiness and
         // the fallback event's from/to_binding_id all keyed on an empty string.
         binding_id: row.get::<_, String>(32).unwrap_or_default(),
+        // 33: route_kind. Older tiers project '' — "an ordinary token", which is
+        // also what the worker must conclude when the kind is genuinely unknown:
+        // it refuses the strict branch rather than guessing
+        // (R-device-routing-token-dispatch-20.S2). Never infer it from
+        // oauth_group_id being set — every pool-backed agent VK has that too.
+        route_kind: row.get::<_, String>(33).unwrap_or_default(),
     })
 }
 
@@ -2469,6 +2501,7 @@ mod account_scope_disable_seq_fence_tests {
         crate::storage::initialize_vault(&salt, &pw).expect("init vault");
 
         let entry = VirtualKeyCacheEntry {
+            route_kind: String::new(),
             binding_id: String::new(),
             priority: 1,
             fallback_role: "primary".to_string(),
@@ -2619,6 +2652,141 @@ mod chain_sync_fence_tests {
 }
 
 #[cfg(test)]
+mod route_kind_sync_fence_tests {
+    use super::*;
+
+    /// Hop ③ of the `route_kind` relay chain: the cluster daemon's cache-row
+    /// upsert must CARRY the route classifier — on the first sync AND on every
+    /// sync after it.
+    ///
+    /// Why this is a behavioural round-trip and not a source-text fence: the
+    /// failure mode has two halves, and only one of them is textual. Leaving
+    /// `route_kind` out of the INSERT column list loses it immediately (a
+    /// source fence would catch that). Leaving it out of
+    /// `ON CONFLICT … DO UPDATE SET` is worse and quieter: the FIRST sync
+    /// writes the right value, so every test that syncs once stays green, and
+    /// the value then freezes forever — a token that later becomes (or stops
+    /// being) a device-routing token never updates on the node. This test
+    /// syncs the same binding row three times to pin both halves.
+    ///
+    /// Why it matters: an empty `route_kind` on the node means the worker
+    /// treats a DEVICE-ROUTING token as an ordinary seat token and picks an
+    /// account by itself instead of serving the one the control plane bound to
+    /// that device (R-device-routing-token-dispatch-20, design §4b.7).
+    ///
+    /// 能红: drop `route_kind` from `upsert_virtual_key_cache`'s
+    /// `ON CONFLICT … DO UPDATE SET` (part 2 fails) or from its INSERT column
+    /// list / params (part 1 fails).
+    #[test]
+    fn route_kind_survives_second_sync() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("vault.db");
+        let _guard = crate::test_env_lock::HomeVaultEnvGuard::new(dir.path(), &db_path);
+        let mut salt = [0u8; 16];
+        crate::crypto::generate_salt(&mut salt).expect("salt");
+        let pw = secrecy::SecretString::new("test_password".to_string());
+        crate::storage::initialize_vault(&salt, &pw).expect("init vault");
+
+        // Real migration chain (initialize_vault → run_migrations) produced this
+        // schema, so the column under test is the one users actually get.
+        let entry = |route_kind: &str| VirtualKeyCacheEntry {
+            binding_id: String::new(),
+            priority: 1,
+            fallback_role: "primary".to_string(),
+            route_group_id: String::new(),
+            route_group_name: String::new(),
+            route_kind: route_kind.to_string(),
+            virtual_key_id: "vk-drt".into(),
+            org_id: "org-1".into(),
+            seat_id: "seat-drt".into(),
+            alias: "vk-drt".into(),
+            provider_code: "anthropic".into(),
+            protocol_type: "anthropic".into(),
+            base_url: String::new(),
+            credential_id: String::new(),
+            credential_revision: String::new(),
+            virtual_key_revision: "vr1".into(),
+            key_status: "active".into(),
+            share_status: "claimed".into(),
+            local_state: "synced_inactive".into(),
+            expires_at: None,
+            provider_key_nonce: None,
+            provider_key_ciphertext: None,
+            synced_at: 0,
+            local_alias: None,
+            supported_providers: vec!["anthropic".into()],
+            provider_base_urls: std::collections::HashMap::new(),
+            owner_account_id: Some("acct-1".into()),
+            owner_email: None,
+            group_runtime: None,
+            group_alias: None,
+            extra: None,
+            oauth_group_id: Some("grp-1".into()),
+            group_accounts: None,
+            routing_config: None,
+        };
+
+        let stored = || -> String {
+            let conn = open_connection().expect("conn");
+            conn.query_row(
+                "SELECT route_kind FROM managed_virtual_keys_cache WHERE virtual_key_id = 'vk-drt'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read route_kind")
+        };
+
+        // Part 1 — the INSERT half, and then a re-sync carrying the SAME value:
+        // the classifier must not be cleared just because the row already existed.
+        upsert_virtual_key_cache(&entry("device_routing_token")).expect("first sync");
+        assert_eq!(
+            stored(),
+            "device_routing_token",
+            "the upsert never wrote route_kind on INSERT — the control plane marks the VK and \
+             the daemon carries it, but the statement drops it, so the worker cannot tell a \
+             device-routing token from a seat token"
+        );
+        upsert_virtual_key_cache(&entry("device_routing_token")).expect("second sync, same value");
+        assert_eq!(
+            stored(),
+            "device_routing_token",
+            "a re-sync cleared route_kind — the row is upserted on every daemon poll, so this \
+             would disable the worker's strict branch a few seconds after it started working"
+        );
+
+        // Part 2 — the DO UPDATE SET half. A device-routing token can stop being
+        // one (令牌删除后账号池重绑, design §4b.8) and an existing VK can become
+        // one, so the value must actually be refreshed, not frozen at first write.
+        upsert_virtual_key_cache(&entry("")).expect("third sync, cleared");
+        assert_eq!(
+            stored(),
+            "",
+            "route_kind is inserted but not refreshed on conflict: the FIRST sync wins forever. \
+             The control plane is authoritative for the route's kind, so a later change (a token \
+             deleted and its pool rebound) would never reach the node — and the worker would \
+             keep serving strict-branch traffic for a route that is no longer device-routing."
+        );
+        upsert_virtual_key_cache(&entry("device_routing_token")).expect("fourth sync, re-marked");
+        assert_eq!(
+            stored(),
+            "device_routing_token",
+            "re-marking must also reach the node"
+        );
+
+        // The struct read path must carry it too, or every CLI/UI consumer that
+        // reads the row back sees an empty kind on a device-routing token.
+        let read_back = get_virtual_key_cache_binding("vk-drt", "anthropic", "anthropic")
+            .expect("read binding")
+            .expect("binding row exists");
+        assert_eq!(
+            read_back.route_kind, "device_routing_token",
+            "the row carries route_kind in SQLite but the read projection drops it — \
+             VirtualKeyCacheEntry.route_kind would be permanently empty for every reader"
+        );
+    }
+}
+
+#[cfg(test)]
 mod key_material_reachable_tests {
     use super::*;
 
@@ -2626,6 +2794,7 @@ mod key_material_reachable_tests {
     /// (ciphertext + share_status) varied; everything else is a benign default.
     fn entry(ciphertext: Option<Vec<u8>>, share_status: &str) -> VirtualKeyCacheEntry {
         VirtualKeyCacheEntry {
+            route_kind: String::new(),
             binding_id: String::new(),
             priority: 1,
             fallback_role: "primary".to_string(),
